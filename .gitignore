@@ -1,0 +1,15 @@
+.gradle/
+build/
+app/build/
+local.properties
+keystore.properties
+*.jks
+*.apk
+*.log
+.idea/
+__pycache__/
+server/config.json
+server/*.pem
+server/node_modules/
+server/audio/
+server/utt/

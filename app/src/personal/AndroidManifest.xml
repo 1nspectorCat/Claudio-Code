@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Personal flavor only: direct battery-exemption request. Play forbids this
+     permission without a core-function justification, so the store flavor
+     opens the system settings list instead (no permission needed). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+</manifest>

@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- v0.36: тема всегда тёмная (палитра захардкожена углём) — DayNight в светлой системной
+         теме давал тёмный текст на тёмном фоне у неперекрашенных виджетов.
+         allowBackup=false: токен и пин релея не должны уезжать в облачный бэкап. -->
+    <application
+        android:label="Claudio Code"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.AppCompat.NoActionBar"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- v0.69: ссылка-настройка. Скрипт установки релея печатает
+                 claudio://setup?url=…&token=…&pin=… (и QR) — конфиг встаёт сам. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="claudio" android:host="setup" />
+            </intent-filter>
+        </activity>
+
+        <!-- v0.56: ТРЕТИЙ КАНАЛ КНОПКИ. Скрин журнала 30.07 доказал: во сне нажатие доходит
+             («кнопка: код 127»), во время диктовки (sco=true) не доходит НИ ОДНОГО события —
+             ни медиа, ни HFP. Похоже, в разговорном профиле гарнитура трактует нажатие как
+             вызов голосового ассистента. Заявляемся получателем — если система поднимет
+             ассистента, поднимет нас, и мы отдадим это рации как нажатие. Активность без UI. -->
+        <activity
+            android:name=".VoiceCmdActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VOICE_COMMAND" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- v0.12 (боевое «кнопки вообще не работают»): кнопки гарнитуры доходят до приложения
+             только если оно заявлено как получатель MEDIA_BUTTON. Без этого их забирает
+             последний медиаплеер системы, и наша MediaSession остаётся ни с чем.
+             v0.39: exported ВОЗВРАЩЁН в true — ужесточение v0.36 (false) совпало с полевым
+             «кнопки перестали работать»; боевое состояние v0.35 было true, и кнопки — ядро
+             рации. НЕ УЖЕСТОЧАТЬ снова без проверки кнопок на устройстве в тот же день. -->
+        <service
+            android:name=".BridgeService"
+            android:exported="true"
+            android:foregroundServiceType="microphone|mediaPlayback">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </service>
+
+        <!-- v0.41: возврат БАЙТ-В-БАЙТ к кнопочной конфигурации v0.35 (последней, где кнопки
+             гарнитуры доказанно работали): штатный androidx-ресивер. Эксперимент с
+             SafeMediaButtonReceiver свёрнут — после него в полевом журнале не появлялось
+             НИ ОДНОГО «кнопка: код», т.е. система перестала доносить нажатия вовсе. -->
+        <receiver
+            android:name="androidx.media.session.MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

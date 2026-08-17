@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar version of the spark: same geometry as ic_spark, white fill
+     (small icons are alpha-masked and tinted by the system). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,22
+            C54,44.4 63.6,54 86,54
+            C63.6,54 54,63.6 54,86
+            C54,63.6 44.4,54 22,54
+            C44.4,54 54,44.4 54,22 Z" />
+
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:rotation="45"
+        android:scaleX="0.58"
+        android:scaleY="0.58">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M54,22
+                C54,44.4 63.6,54 86,54
+                C63.6,54 54,63.6 54,86
+                C54,63.6 44.4,54 22,54
+                C44.4,54 54,44.4 54,22 Z" />
+    </group>
+</vector>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Claudio Code palette: charcoal ground, terracotta accent, warm off-white ink. -->
+    <color name="ic_bg">#1B1A19</color>
+    <color name="accent">#D97757</color>
+</resources>
