@@ -657,7 +657,7 @@ class BridgeService : Service() {
     private val cuePlayWhenReady: MutableSet<String> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
-    // Имена проектов приходят слагами (my_project) — озвучка читает подчёркивания вслух.
+    // Имена проектов приходят слагами (voicebridge_app) — озвучка читает подчёркивания вслух.
     private fun spoken(n: String) = n.replace('_', ' ').replace('-', ' ')
 
     // Произнести произвольную фразу громким путём: есть файл — играем, нет — синтезируем
@@ -1852,9 +1852,24 @@ class BridgeService : Service() {
 
     private fun savePicked(set: Set<String>) {
         Cfg.pickedSids = set.joinToString(",")
+        // v1.11: имя канала запоминается рядом с sid. По книге сессий его сверять нельзя —
+        // SessionBook держит 20 записей и вытесняет самые давние, то есть ровно тот канал,
+        // с которым работают весь день.
+        val prev = pickedNameMap()
+        Cfg.pickedNames = set.joinToString(",") { sid ->
+            val nm = (SessionBook.all().firstOrNull { it.sid == sid }?.proj?.takeIf { it.isNotEmpty() }
+                ?: prev[sid].orEmpty()).replace(",", " ").replace("=", " ")
+            "$sid=$nm"
+        }
         Cfg.soloSid = if (set.size == 1) set.first() else ""   // совместимость со старой веткой
         Cfg.save(this)
     }
+
+    private fun pickedNameMap(): Map<String, String> =
+        Cfg.pickedNames.split(",").mapNotNull {
+            val p = it.split("=", limit = 2)
+            if (p.size == 2 && p[0].isNotBlank() && p[1].isNotBlank()) p[0].trim() to p[1].trim() else null
+        }.toMap()
 
     // Добавить/убрать канал из рабочего набора. Возвращает: канал теперь в наборе?
     fun togglePicked(sid: String): Boolean {
@@ -1888,6 +1903,44 @@ class BridgeService : Service() {
         if (n > 0) { dropForeign(playQueue); dropForeign(heldQueue) }
         updateNotification()
         return nowIn
+    }
+
+    // v1.11 (боевое, 17.08: «почему автоозвучка не происходит?»). Claude Code при сжатии
+    // контекста заводит сессии НОВЫЙ id — для рации это ранее невиданный канал, и в рабочий
+    // набор он не входит. Сессия, с которой человек работает весь день, замолкает молча и
+    // необъяснимо: в журнале «молчит: работаю с …», а его на ходу никто не читает.
+    //
+    // Наследуем выбор ПО ИМЕНИ, но с четырьмя замками — без них правка опаснее болезни
+    // (имя проекта НЕ уникально: readback.py берёт его из имени рабочей папки, и все сессии
+    // одной папки называются одинаково — у юзера бывало по четыре «playbook»):
+    //   1) только канал, которого телефон НИКОГДА не видел (сжатие всегда даёт новый id);
+    //   2) только если одноимённый выбранный канал молчит уже 5 минут — живая соседка по
+    //      папке говорит чаще и выбор не украдёт;
+    //   3) ЗАМЕНА, а не добавление: набор не растёт, дублей с одним именем не заводится;
+    //   4) канал, убранный руками (долгий тап), не возвращается.
+    // Адресат переезжает вместе с выбором — иначе диктовка ушла бы в закрытый id (v0.41).
+    private fun inheritPick(sid: String, proj: String, firstTime: Boolean) {
+        if (!firstTime || sid.isEmpty() || proj.isEmpty()) return
+        if (Cfg.pickedSids.isEmpty()) return          // слышно всех — наследовать нечего
+        if (SessionBook.isForgotten(this, sid)) return
+        val set = picked()
+        if (set.contains(sid)) return
+        val names = pickedNameMap()
+        val now = System.currentTimeMillis()
+        val old = set.firstOrNull { o ->
+            names[o] == proj &&
+                now - (SessionBook.all().firstOrNull { it.sid == o }?.lastTs ?: 0L) > 300_000
+        } ?: return
+        savePicked(set - old + sid)
+        if (Cfg.replyTarget == old) {
+            Cfg.replyTarget = sid
+            Cfg.save(this)
+            lastAnnouncedTarget = null
+            ensureTargetCues()
+        }
+        LogBus.add("«${proj}» продолжился под новым номером — перенёс выбор со старого")
+        cue("канал " + spoken(proj) + " продолжается")
+        updateNotification()
     }
 
     private fun soloName(): String {
@@ -2381,7 +2434,10 @@ class BridgeService : Service() {
             }
             "voice" -> {
                 val sid = o.optString("session")
+                // «видели ли мы этот канал раньше» надо снять ДО seen — она сама заводит запись
+                val firstTime = SessionBook.all().none { it.sid == sid }
                 SessionBook.seen(this, sid, o.optString("proj"), o.optLong("ts"))
+                inheritPick(sid, o.optString("proj"), firstTime)
                 // v0.73: юзер выбросил это сообщение в разборе накопленного — его хвост
                 // (части приходят с разрывом до минуты) играть нельзя, он его отменил
                 if (skippedMsgIds.contains(sid + "|" + o.optString("msgid"))) {

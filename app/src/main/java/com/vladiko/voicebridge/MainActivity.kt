@@ -1054,39 +1054,35 @@ class MainActivity : AppCompatActivity() {
         val closeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 0, 1f))
+            // v1.10 (скрин юзера: три кнопки не влезали в ширину и «закрыть» обрезалось
+            // до «зак»). Ряд теперь делится по весу: каждая кнопка получает свою треть,
+            // подписи короче, шрифт и отступы мельче. Распорка убрана — она отбирала
+            // ширину у самих кнопок.
+            fun sheetBtn(label: String, weight: Float, onTap: () -> Unit) =
+                tv(label, 11.5f, cDim).apply {
+                    background = bordered(10)
+                    setPadding(dp(8), dp(6), dp(8), dp(6))
+                    gravity = Gravity.CENTER
+                    maxLines = 1
+                    val lp = LinearLayout.LayoutParams(0, WRAP_CONTENT, weight)
+                    lp.leftMargin = dp(5)
+                    lp.rightMargin = dp(5)
+                    layoutParams = lp
+                    setOnClickListener { onTap() }
+                }
             // v1.09 (слово юзера: «вернуть нужны не все, а конкретные — галочками»)
-            addView(tv("✎ править список", 12.5f, cDim).apply {
-                background = bordered(10)
-                setPadding(dp(12), dp(6), dp(12), dp(6))
-                contentDescription = "выбрать галочками, какие каналы держать в списке"
-                setOnClickListener {
-                    sheetEditMode = !sheetEditMode
-                    if (sheetEditMode) { lastSessionsFetch = 0L; fetchSessions() }
-                    rebuildSheet()
-                }
-            })
+            addView(sheetBtn("✎ править", 1.1f) {
+                sheetEditMode = !sheetEditMode
+                if (sheetEditMode) { lastSessionsFetch = 0L; fetchSessions() }
+                rebuildSheet()
+            }.apply { contentDescription = "выбрать галочками, какие каналы держать в списке" })
             // v1.03 (слово юзера: «не вижу кнопку обновления списка каналов»)
-            addView(tv("↻ обновить", 12.5f, cDim).apply {
-                val lp0 = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
-                lp0.leftMargin = dp(8)
-                layoutParams = lp0
-                background = bordered(10)
-                setPadding(dp(12), dp(6), dp(12), dp(6))
-                setOnClickListener {
-                    lastSessionsFetch = 0L
-                    fetchSessions()
-                    LogBus.add("список каналов обновляется с сервера")
-                }
+            addView(sheetBtn("↻ обновить", 1.15f) {
+                lastSessionsFetch = 0L
+                fetchSessions()
+                LogBus.add("список каналов обновляется с сервера")
             })
-            addView(tv("✕ закрыть", 12.5f, cDim).apply {
-                background = bordered(10)
-                setPadding(dp(12), dp(6), dp(12), dp(6))
-                val lp = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
-                lp.leftMargin = dp(8)
-                layoutParams = lp
-                setOnClickListener { sheetOverlay.visibility = View.GONE }
-            })
+            addView(sheetBtn("✕ закрыть", 1.1f) { sheetOverlay.visibility = View.GONE })
         }
         val listScroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = true

@@ -35,6 +35,10 @@ object Cfg {
     // Набор рабочих каналов — ПРАВИЛО, как и solo: слышны ровно эти sid, всё остальное молчит,
     // включая сессии, которых телефон ещё не видел. Пусто = слышу всех (прежнее поведение).
     var pickedSids = ""     // CSV
+    // v1.11: снимок имён выбранных каналов, CSV пар "sid=имя". Нужен потому, что SessionBook
+    // держит только 20 записей и вытесняет САМЫЕ СТАРЫЕ — то есть именно тот канал, с которым
+    // работают весь день. Сверять имя по книге значит потерять его в самый нужный момент.
+    var pickedNames = ""
     var voiceCues = true    // v0.26: spoken cues ("слушаю"/"ушло") — beeps get lost over SCO
     // v0.35: dictation goes to server whisper (fallback: Android recognizer).
     // v0.67: default is flavor-dependent — personal true (owner runs whisper.cpp),
@@ -69,6 +73,7 @@ object Cfg {
         replyTarget = p.getString("replyTarget", "") ?: ""
         soloSid = p.getString("soloSid", "") ?: ""
         pickedSids = p.getString("pickedSids", "") ?: ""
+        pickedNames = p.getString("pickedNames", "") ?: ""
         // миграция: включённый solo — это набор из одного канала
         if (pickedSids.isEmpty() && soloSid.isNotEmpty()) pickedSids = soloSid
         voiceCues = p.getBoolean("voiceCues", true)
@@ -93,6 +98,7 @@ object Cfg {
             .putString("replyTarget", replyTarget)
             .putString("soloSid", soloSid)
             .putString("pickedSids", pickedSids)
+            .putString("pickedNames", pickedNames)
             .putBoolean("voiceCues", voiceCues)
             .putBoolean("whisper", whisper)
             .putBoolean("micVoiceComm", micVoiceComm)
