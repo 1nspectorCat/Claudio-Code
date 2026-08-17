@@ -23,17 +23,24 @@
 //  - abandoned utts are delivered with an explicit marker;
 //  - a bad file can no longer abort the whole tick (per-file try/catch).
 //
-// Runs as pm2 process `voice-whisper`, niced so finsovetnik never starves.
+// Runs as pm2 process `voice-whisper`, niced so other processes on the box never starve.
+//
+// Paths: by default everything is taken from the directory this file sits in — the same
+// place install-relay.sh puts config.json and where relay.js writes utt/. Override with
+// environment variables if your layout differs:
+//   VB_DIR=/srv/claudio  WHISPER_BIN=/opt/whisper.cpp/build/bin/whisper-cli \
+//   WHISPER_MODEL=/opt/whisper.cpp/models/ggml-base.bin  pm2 start transcribe.js --name voice-whisper
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const https = require('https');
 
-const DIR = path.join(process.env.HOME, 'voice_bridge');
+const DIR = process.env.VB_DIR || __dirname;
 const UTT_DIR = path.join(DIR, 'utt');
 const CFG = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
-const WHISPER = path.join(process.env.HOME, 'whisper.cpp', 'build', 'bin', 'whisper-cli');
-const MODEL = path.join(process.env.HOME, 'whisper.cpp', 'models', 'ggml-base.bin');
+const HOME = process.env.HOME || '';
+const WHISPER = process.env.WHISPER_BIN || path.join(HOME, 'whisper.cpp', 'build', 'bin', 'whisper-cli');
+const MODEL = process.env.WHISPER_MODEL || path.join(HOME, 'whisper.cpp', 'models', 'ggml-base.bin');
 const PORT = CFG.port || 8443;
 
 const log = (m) => process.stdout.write(`[${new Date().toISOString()}] ${m}\n`);
@@ -448,6 +455,16 @@ async function tick() {
 
 function lastTouch(utt) {
   try { return fs.statSync(path.join(UTT_DIR, `${utt}.meta.json`)).mtimeMs; } catch (_) { return 0; }
+}
+
+// Fail loudly at startup instead of silently transcribing nothing: a missing binary or
+// model only shows up later as "the radio never returns any text", which is hard to trace.
+for (const [what, p] of [['whisper binary', WHISPER], ['whisper model', MODEL]]) {
+  if (!fs.existsSync(p)) {
+    log(`FATAL: ${what} not found at ${p}`);
+    log('build whisper.cpp and download a model, or point WHISPER_BIN / WHISPER_MODEL at them');
+    process.exit(1);
+  }
 }
 
 log(`voice-whisper up: watching ${UTT_DIR}, model ${path.basename(MODEL)}`);

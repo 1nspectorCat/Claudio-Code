@@ -1,39 +1,45 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Voice readback (audio) — global Claude Code Stop hook.
-Takes the last assistant message, strips markdown to speech-friendly text,
-synthesizes Russian speech (edge-tts), converts to OGG/Opus (ffmpeg) and sends
-it as a Telegram VOICE message. Long answers are split into several voice
-messages that Telegram autoplays in order.
+Voice readback — global Claude Code Stop hook for Claudio Code.
 
-Gating: runs only if toggle file ON exists AND config.json present.
-Config: ~/.claude/voice\\config.json = {"botToken","chatId","voice"?}
-Toggle: presence of ~/.claude/voice\\ON   ("voice off" = delete it)
+Takes the last assistant message, strips markdown down to speech-friendly text,
+synthesizes speech (edge-tts), converts it to OGG/Opus (ffmpeg) and pushes it to
+YOUR relay, which hands it to the phone. Long answers are split into parts that
+the radio plays in order.
+
+Requirements: python 3, `pip install edge-tts`, ffmpeg and curl on PATH.
+
+Config: ~/.claude/voice/bridge/config.json
+  { "url": "https://<your-server>:8443",
+    "token": "<the token printed by install-relay.sh>",
+    "cacert": "cert.pem",          # copy it from the server, same folder
+    "voice": "ru-RU-DmitryNeural" } # any edge-tts voice
+
+Toggle: presence of ~/.claude/voice/ON   (delete the file = voice off)
+Log:    ~/.claude/voice/readback.log     (every refusal is written here)
 Defensive: any failure exits 0 so the session is never disrupted.
 
-Hardening (15.06): single-instance LOCK + content DEDUP + per-run TEMP files +
-per-part TIMEOUT + skip-empty. Fixes duplicate / truncated voices that appeared
-when many Stop events overlapped while edge-tts was slow and clobbered the shared
-out.mp3/out.ogg scratch files.
+Hardening: single-instance LOCK + content DEDUP + per-run TEMP files + per-part
+TIMEOUT + skip-empty — these fix duplicate and truncated voices that appear when
+several Stop events overlap while edge-tts is slow.
 """
 import os, sys, json, re, asyncio, subprocess, tempfile, time, hashlib
 
 DIR = os.path.join(os.environ.get("USERPROFILE") or os.path.expanduser("~"), ".claude", "voice")
 TOGGLE = os.path.join(DIR, "ON")
-CONFIG = os.path.join(DIR, "config.json")
 LOG = os.path.join(DIR, "readback.log")
 LOCK = os.path.join(DIR, "readback.lock")
 LASTSENT = os.path.join(DIR, "last_sent.txt")
 DEFAULT_VOICE = "ru-RU-DmitryNeural"
-# (12.07) edge-tts стал регулярно таймаутить (TimeoutError бросками весь день, части терялись:
-# «sent 1/2» — юзер получал хвост без начала). Куски меньше (синтез быстрее → меньше таймаутов),
-# таймаут щедрее, попыток больше; при полном провале синтеза часть уходит ТЕКСТОМ (см. send_text_fallback).
-MAX_CHARS = 1100          # per voice message (было 1600)
+# edge-tts times out often enough that one attempt loses parts of an answer, and a
+# listener who gets part 2 without part 1 has no way to notice. Smaller chunks
+# synthesize faster (fewer timeouts), the timeout is generous, retries are many.
+MAX_CHARS = 1100          # per voice part
 HARD_CAP = 12000          # absolute ceiling per answer
-SYNTH_TIMEOUT = 60        # seconds per part (было 30) — a hung edge-tts can't stall the whole readback
-SYNTH_RETRIES = 4         # попыток синтеза на часть (было 3), пауза нарастает
-LOCK_TTL = 240            # seconds — a lock fresher than this means another run is active (учтён рост таймаута)
+SYNTH_TIMEOUT = 60        # seconds per part — a hung edge-tts can't stall the whole readback
+SYNTH_RETRIES = 4         # attempts per part, with a growing pause
+LOCK_TTL = 240            # seconds — a lock fresher than this means another run is active
 
 def log(m):
     try:
@@ -44,16 +50,16 @@ def log(m):
         pass
 
 # ── single-instance lock: prevent overlapping runs racing on temp files ──
-# (12.07 v2) НЕ скипаем при занятом локе, а ЖДЁМ очередь: мгновенный скип молча терял
-# ЦЕЛЫЕ ответы при параллельных сессиях (лог 11:27/11:34/12:42 «skip: another readback
-# active» = юзер не получил те сообщения вообще). Ждём до LOCK_WAIT, потом всё равно скип.
+# Queue instead of skipping: with parallel sessions an instant skip silently dropped
+# WHOLE answers ("skip: another readback active" in the log meant the user never heard
+# that message at all). Wait up to LOCK_WAIT, then skip honestly and log it.
 LOCK_WAIT = 150
 def acquire_lock():
     try:
         waited = 0
         while os.path.exists(LOCK) and (time.time() - os.path.getmtime(LOCK)) < LOCK_TTL:
             if waited >= LOCK_WAIT:
-                return False                  # очередь не дождалась — честный скип (залогируется)
+                return False                  # waited long enough — honest skip, logged
             time.sleep(3); waited += 3
     except Exception:
         pass
@@ -86,7 +92,7 @@ def is_duplicate(speech):
 
 def to_speech(md):
     t = md
-    t = re.sub(r"```[\s\S]*?```", " (фрагмент кода — смотри в тексте) ", t)
+    t = re.sub(r"```[\s\S]*?```", " (code block — read it on screen) ", t)
     t = re.sub(r"^\s*\|.*\|\s*$", "", t, flags=re.M)
     t = re.sub(r"^\s*[-:|\s]+\s*$", "", t, flags=re.M)
     t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t)
@@ -124,22 +130,8 @@ async def synth(text, mp3_path, voice):
     import edge_tts
     await asyncio.wait_for(edge_tts.Communicate(text, voice=voice).save(mp3_path), timeout=SYNTH_TIMEOUT)
 
-# (12.07) СТРАХОВКА СОДЕРЖАНИЯ: голос не синтезировался/не сконвертировался → шлём часть ТЕКСТОМ
-# в тот же чат. Хуже голоса, но юзер на ходу больше не теряет куски ответа молча.
-def send_text_fallback(token, chat, part):
-    try:
-        r = subprocess.run(
-            ["curl", "-s", "-F", "chat_id=%s" % chat,
-             "-F", "text=🔇 (голос не синтезировался — текстом)\n\n%s" % part[:3900],
-             "https://api.telegram.org/bot%s/sendMessage" % token],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return r.returncode == 0
-    except Exception as e:
-        log("text fallback fail: %s" % e)
-        return False
 
-# ── (16.07) voice-bridge: копия готового OGG уходит в локальный релей для телефона-рации.
-# Полностью независим от телеграм-пути: нет config/релей лежит — молча пропускаем.
+# ── the finished OGG goes to your relay, which hands it to the phone ──────────
 BRIDGE_CFG = os.path.join(DIR, "bridge", "config.json")
 def bridge_push(ogg, sid, proj, part_text, part_i, parts_n, msgid="", ctx=""):
     try:
@@ -156,23 +148,39 @@ def bridge_push(ogg, sid, proj, part_text, part_i, parts_n, msgid="", ctx=""):
         if bc.get("cacert"):
             cmd += ["--cacert", os.path.join(DIR, "bridge", bc["cacert"])]
         cmd += ["-X", "POST", "--data-binary", "@%s" % ogg, url]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=8)
+        if r.returncode != 0:
+            # Silence here used to be the worst failure mode: the answer simply never
+            # arrived and nothing said why. curl 60 = TLS check failed, which on a
+            # self-signed relay means the cacert is missing or points at the wrong file.
+            hint = ""
+            if r.returncode == 60:
+                hint = (" — TLS check failed: copy cert.pem from the server into "
+                        "~/.claude/voice/bridge/ and set \"cacert\": \"cert.pem\"")
+            elif r.returncode == 7 or r.returncode == 28:
+                hint = " — relay unreachable: wrong url, or port closed in the server firewall"
+            log("bridge push failed rc=%d%s | %s" % (r.returncode, hint,
+                                                     (r.stderr or b"").decode("utf-8", "ignore").strip()[:160]))
+            return False
+        return True
     except Exception as e:
         log("bridge push fail: %s" % e)
+    return False
 
 def main():
     if not os.path.exists(TOGGLE):
         return
-    if not os.path.exists(CONFIG):
-        log("no config"); return
+    if not os.path.exists(BRIDGE_CFG):
+        log("no relay config: create %s (see README)" % BRIDGE_CFG); return
     try:
-        cfg = json.load(open(CONFIG, encoding="utf-8"))
+        cfg = json.load(open(BRIDGE_CFG, encoding="utf-8"))
     except Exception:
-        log("bad config"); return
-    token, chat = cfg.get("botToken"), cfg.get("chatId")
+        log("bad relay config: %s is not valid JSON" % BRIDGE_CFG); return
+    if not cfg.get("url") or not cfg.get("token"):
+        log("relay config needs both \"url\" and \"token\""); return
+    if not cfg.get("cacert"):
+        log("warning: no \"cacert\" in relay config — a self-signed relay will reject the push")
     voice = cfg.get("voice") or DEFAULT_VOICE
-    if not token or not chat:
-        log("config missing token/chat"); return
 
     raw = sys.stdin.read()
     try:
@@ -185,14 +193,12 @@ def main():
     sid = payload.get("session_id") or ""
     proj = os.path.basename(payload.get("cwd") or "") or ""
 
-    # (15.08, слово юзера: «названия сессий в рации не совпадают с тем, что я вижу в Claude
-    # Code, и путаются»). Заголовок, который юзер задал сессии сам, лежит первой строкой
-    # транскрипта (customTitle). Есть он — рация называет канал ИМЕННО ТАК; нет — как было,
-    # именем рабочей папки. Ошибка чтения не должна ронять озвучку.
+    # Channel name: if you gave the session a custom title in Claude Code, the radio should
+    # call the channel exactly that — otherwise the names on the phone do not match what you
+    # see on screen. Falls back to the working directory name. Never let this break readback.
     try:
-        # (17.08 v2, боевое: сессия называется «мета судья», а рация говорила «брейншторм»)
-        # customTitle лежит НЕ ОБЯЗАТЕЛЬНО в первой строке транскрипта — сканируем начало
-        # файла, иначе откатывались на имя рабочей папки.
+        # customTitle is NOT necessarily on the first line of the transcript, so scan the
+        # head of the file; a first-line-only check silently fell back to the folder name.
         _title = ""
         with open(tpath, encoding="utf-8") as _fh:
             for _i, _ln in enumerate(_fh):
@@ -206,9 +212,9 @@ def main():
                 if _t:
                     _title = _t
                     break
-        # (17.08, боевое: после /clear Claude Code заводит НОВЫЙ файл разговора, заголовка в
-        # нём ещё нет — и канал внезапно переименовывался в имя рабочей папки («мета судья»
-        # превращалась в «финсоветник»). Помним последнее известное имя для этой папки.
+        # After /clear, Claude Code starts a NEW transcript file that has no title yet — the
+        # channel would suddenly rename itself to the folder name mid-conversation. Remember
+        # the last known title per working directory.
         import re as _re2
         _slug = _re2.sub(r"[^A-Za-z0-9_-]", "-", payload.get("cwd") or "noproj")
         _nf = os.path.join(DIR, "bridge", "title_%s.txt" % _slug)
@@ -230,10 +236,10 @@ def main():
     except Exception:
         pass
 
-    # v0.40c (боевое «сессия не слушает НА СВОЮ ЖЕ сессию»): id сессии МЕНЯЕТСЯ при сжатии
-    # контекста — озвучка уходит под новым id, а Monitor-поллер сессии слушает старый.
-    # Ведём историю id беседы per-проект: поллер (скилл voice-bridge) каждые 3с перечитывает
-    # хвост этого файла и опрашивает все свежие id — приёмник сам следует за сменой.
+    # A session id CHANGES when the context is compacted: the answer goes out under the new
+    # id while the session's poller is still listening on the old one, and the user's replies
+    # land nowhere. Keep a per-project history of ids — the poller re-reads the tail of this
+    # file every few seconds and polls all recent ids, so the receiver follows the change.
     try:
         if sid:
             import re as _re
@@ -314,7 +320,6 @@ def main():
         log("skip duplicate"); return
 
     parts = chunk(speech, MAX_CHARS)
-    url = "https://api.telegram.org/bot%s/sendVoice" % token
     msgid = str(int(time.time() * 1000))   # groups this reply's parts into one message
     sent = 0
     for part_i, part in enumerate(parts, 1):
@@ -324,8 +329,7 @@ def main():
         try:
             fd, mp3 = tempfile.mkstemp(suffix=".mp3", dir=DIR); os.close(fd)
             fd, ogg = tempfile.mkstemp(suffix=".ogg", dir=DIR); os.close(fd)
-            # retry transient edge-tts/network failures (18.06): раньше один блик/таймаут терял часть
-            # навсегда. (12.07) попыток больше, пауза нарастает; полный провал → ТЕКСТ-фолбэк, не потеря.
+            # Retry transient edge-tts/network failures: one blip used to lose a part forever.
             synth_ok = False
             for attempt in range(SYNTH_RETRIES):
                 try:
@@ -336,50 +340,17 @@ def main():
                     log("synth attempt %d fail: %r" % (attempt + 1, se))
                 time.sleep(1.5 * (attempt + 1))
             if not synth_ok:
-                log("synth gave up after retries → text fallback")
-                if send_text_fallback(token, chat, part):
-                    sent += 1
+                log("synth gave up after %d retries — part %d/%d lost (is edge-tts installed?)"
+                    % (SYNTH_RETRIES, part_i, len(parts)))
                 continue
             r = subprocess.run(
                 ["ffmpeg", "-y", "-i", mp3, "-c:a", "libopus", "-b:a", "32k", ogg],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if r.returncode != 0 or not os.path.exists(ogg) or os.path.getsize(ogg) == 0:
-                log("ffmpeg fail → text fallback")
-                if send_text_fallback(token, chat, part):
-                    sent += 1
+                log("ffmpeg failed (rc=%d) — is ffmpeg on PATH?" % r.returncode)
                 continue
-            bridge_push(ogg, sid, proj, part, part_i, len(parts), msgid, ctx if part_i == 1 else "")   # рация: копия в релей
-            # (18.07, слово юзера — приватность) файл NO_TG выключает телеграм-дубль: звук ТОЛЬКО через
-            # рацию, озвучки не попадают на серверы Телеграма. Вернуть дубль = удалить файл NO_TG.
-            if os.path.exists(os.path.join(DIR, "NO_TG")):
+            if bridge_push(ogg, sid, proj, part, part_i, len(parts), msgid, ctx if part_i == 1 else ""):
                 sent += 1
-                continue
-            # (12.07 v2) curl возвращает 0 даже когда Telegram отвечает отказом (429 флуд-лимит
-            # на пачках из 4-6 частей) — раньше это логировалось как «sent». Читаем ответ API,
-            # на 429 ждём retry_after и повторяем; полный провал → текст-фолбэк, не потеря.
-            ok_send = False
-            for _ in range(2):
-                r2 = subprocess.run(
-                    ["curl", "-s", "-F", "chat_id=%s" % chat, "-F", "voice=@%s" % ogg, url],
-                    capture_output=True, text=True)
-                try:
-                    resp = json.loads(r2.stdout or "{}")
-                except Exception:
-                    resp = {}
-                if resp.get("ok"):
-                    ok_send = True; break
-                wait_s = 3
-                try:
-                    wait_s = int(resp.get("parameters", {}).get("retry_after", 2)) + 1
-                except Exception:
-                    pass
-                log("sendVoice not ok (err=%s) → retry in %ds" % (resp.get("error_code"), wait_s))
-                time.sleep(wait_s)
-            if ok_send:
-                sent += 1
-            elif send_text_fallback(token, chat, part):
-                sent += 1
-            time.sleep(1.1)                       # pacing: многочастный ответ не долбит флуд-лимит
         except Exception as e:
             log("part fail: %s" % e)
         finally:

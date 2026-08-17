@@ -1,0 +1,17 @@
+{
+  "name": "claudio-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Relay for Claudio Code: keeps per-session queues between Claude Code sessions and the phone",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

@@ -2,13 +2,15 @@
 
 Talk to your Claude Code sessions **by voice, hands‑free, from your phone** — their
 answers are read out loud into your headset, you reply by speaking, and several
-sessions can run at once as separate channels.
+sessions run at once as separate channels.
 
 Built for one real situation: you are walking, riding, driving or cooking, both hands
 are busy, and your agents on the desktop keep finishing tasks and asking questions.
 
-> Russian speech out of the box (server‑side whisper.cpp or Android recognition).
-> The UI is Russian; the code and setup are English.
+> **Android 8+ only** — there is no iOS version and none is planned.
+> **Russian speech only** — recognizer, voice, spoken commands and UI are Russian
+> (see [Using another language](#using-another-language)).
+> **Your own Linux server required** — there is no hosted service, by design.
 
 ---
 
@@ -23,58 +25,105 @@ are busy, and your agents on the desktop keep finishing tasks and asking questio
 - **A gap between channels.** When two sessions answer back to back, the radio pauses
   and offers you 12 seconds to answer the first one before the second starts.
 - **Chat feed on screen.** Their answers on the left, yours on the right, replayable.
-- **Nothing is lost when you are offline.** Answers wait on your relay and arrive later.
+- **Reconnect catch‑up.** When the phone comes back online it picks up what arrived in
+  the last 30 minutes (up to the 10 most recent parts). That backlog lives in the
+  relay's memory, so restarting the relay clears it; whatever already reached the phone
+  is stored on the phone and survives.
 
 ## What you need
 
-- An **Android phone** (Android 8+).
-- A **Linux server** you control (the cheapest VPS is fine) — it relays audio and text
-  between the desktop and the phone. There is no shared cloud: everything is yours.
-- **Claude Code** on your desktop (Windows/macOS/Linux) with Python 3 and ffmpeg.
+- An **Android phone** (Android 8+). Bluetooth headset with a button is a plus, not a must.
+- A **Linux server** you control (the cheapest VPS is fine) with **Node.js 18+**,
+  `openssl` and `curl`. Optional: `qrencode` (prints the setup QR in the terminal),
+  `pm2` (keeps the relay running across reboots).
+- **Claude Code** on your desktop (Windows/macOS/Linux) with **Python 3**,
+  **`pip install edge-tts`**, **ffmpeg** and **curl** available on PATH.
 
-## Setup in three steps
+## Setup
 
-**1. Server (about 5 minutes)**
+### 1. Server (about 5 minutes)
 
 ```bash
-# on your server, in one directory
-git clone <this repo> && cd <repo>/server
+git clone https://github.com/1nspectorCat/Claudio-Code.git
+cd Claudio-Code/server
 bash install-relay.sh
 ```
 
-The script generates a token and a TLS certificate, installs the single npm dependency,
-starts the relay, verifies it answers, and prints a **setup link + QR code**.
+The script generates a token and a self‑signed TLS certificate, installs the single npm
+dependency, starts the relay, verifies it answers, checks whether the port is reachable
+from outside, and prints a **setup link + QR code**.
 
-**2. Phone**
+**Open the port.** The relay listens on TCP 8443. On most providers that port is closed
+by default — in the VM firewall (`sudo ufw allow 8443/tcp`) *and* in the provider's own
+cloud firewall / security list (Oracle, AWS, GCP, Azure each have one). The installer
+warns you if it cannot reach itself from outside.
 
-Install the APK from [Releases](../../releases), open it and scan the QR code from
-step 1 — address, token and certificate fingerprint fill themselves in. Nothing to type.
+### 2. Phone (1 minute)
 
-**3. Desktop**
+Install the APK from [Releases](../../releases). Then point your phone's **camera app**
+at the QR code from step 1 — the app has no built‑in scanner; the camera recognizes the
+`claudio://setup?…` link and opens Claudio Code with address, token and certificate
+fingerprint filled in. The app asks you to confirm the server before saving it.
 
-Copy `desktop/readback.py` to `~/.claude/voice/` and register it as a Stop hook in
-`~/.claude/settings.json`:
+No camera? In the app: Settings → «для продвинутых» → paste one line: `address|token|pin`.
+
+### 3. Desktop — answers → phone
+
+Copy `desktop/readback.py` to `~/.claude/voice/` and create
+`~/.claude/voice/bridge/config.json` (template: `desktop/bridge-config.example.json`):
+
+```json
+{ "url": "https://YOUR.SERVER.IP:8443",
+  "token": "the token install-relay.sh printed",
+  "cacert": "cert.pem",
+  "voice": "ru-RU-DmitryNeural" }
+```
+
+**Copy `cert.pem` from the server** into `~/.claude/voice/bridge/` — the relay's
+certificate is self‑signed, and without this file every push fails.
+
+Register the hook in `~/.claude/settings.json`. **Merge this into your existing file —
+do not replace it:**
 
 ```json
 { "hooks": { "Stop": [ { "hooks": [ { "type": "command",
-  "command": "python ~/.claude/voice/readback.py", "async": true } ] } ] } }
+  "command": "python3 $HOME/.claude/voice/readback.py", "async": true } ] } ] } }
 ```
 
-Create `~/.claude/voice/bridge/config.json` with the relay URL and token printed by the
-installer, and an empty file `~/.claude/voice/ON` to switch the voice output on.
+On Windows use the expanded path instead — `%USERPROFILE%` is not expanded inside the
+hook string either, so write it out: `"command": "python C:\\Users\\<you>\\.claude\\voice\\readback.py"`
+(use `py` instead of `python` if that is how Python is installed).
 
-Each session also needs a tiny poller that pulls your replies from the relay — see
-[docs/SETUP.md](docs/SETUP.md).
+Finally create an empty file `~/.claude/voice/ON` — its presence is the on/off switch
+for voice output. Deleting it silences everything.
+
+**Check it works:** answer something in a session, then look at
+`~/.claude/voice/readback.log`. A line `sent 1/1 voice part(s)` means the answer reached
+your relay. Every refusal is written there too, with the reason.
+
+### 4. Desktop — your voice → sessions
+
+The relay holds one queue per session, and something must drain it. Copy
+`desktop/skill/voice-bridge/` into `~/.claude/skills/` — then a session arms its own
+receiver when you say "arm the voice bridge" (or `/voice-bridge`). The skill explains
+what the loop does and why every guard in it exists.
+
+Only one poller per session: `GET /consume` hands the queue over exactly once, so two
+pollers split your messages and half of them vanish.
+
+To check the path by hand: `bash desktop/poller.sh` prints whatever the relay is holding.
 
 ## Two recognition modes
 
 | | Android recognition | Server whisper.cpp |
 |---|---|---|
-| Setup | works out of the box | build whisper.cpp on the server |
+| Setup | no extra server software | build whisper.cpp on your server |
 | Quality in noise | mediocre | noticeably better |
 | Headset button during dictation | works | does not (the headset eats the press) |
 
-Switch in Settings → «для продвинутых» → «распознавание whisper».
+Both modes need your relay — it is the only path between the phone and your sessions.
+Switch in Settings → «для продвинутых» → «распознавание whisper». Server‑side
+recognition needs `whisper.cpp` and `server/transcribe.js`; see [docs/SETUP.md](docs/SETUP.md).
 
 ## Voice commands
 
@@ -89,13 +138,47 @@ Switch in Settings → «для продвинутых» → «распозна�
 
 Full user guide (in Russian): [docs/GUIDE.md](docs/GUIDE.md).
 
+## Build it yourself
+
+Requires JDK 17 and the Android SDK with platform 35.
+
+```bash
+./gradlew assembleStoreDebug     # app/build/outputs/apk/store/debug/
+```
+
+Two flavors: `store` ships with empty settings (what the Releases APK is built from),
+`personal` bakes a relay address into the build from `local.properties` — handy if you
+reinstall often and do not want to rescan the QR.
+
 ## Privacy
 
-- Audio never leaves your machines: speech recognition runs either on the phone or on
-  **your** server.
-- The relay is yours, the token is yours, TLS is pinned to your own certificate.
-- The phone keeps the conversation locally so it survives a relay restart.
-- See [docs/PRIVACY.md](docs/PRIVACY.md).
+The app talks only to the relay you configured: recorded audio and text go there over
+TLS pinned to your own certificate, and nowhere else. The relay is yours, the token is
+yours, and the phone keeps the conversation locally so it survives a relay restart.
+
+Three things do leave your machines, and you should know about them:
+
+- **Speech recognition.** With the default Android recognizer, audio goes to whatever
+  recognition service your phone uses — on most devices that is Google. Switching to
+  server‑side whisper.cpp keeps audio on your own server.
+- **Speech synthesis.** The desktop hook uses Microsoft's `edge-tts` cloud service, so
+  the *text* of each answer is sent there to be turned into speech.
+- **Nothing else.** No analytics, no crash reporting, no developer‑operated backend.
+
+Details, including what is stored on the server and how to clear it:
+[docs/PRIVACY.md](docs/PRIVACY.md).
+
+## Using another language
+
+Russian is hardcoded in four places — change all four:
+
+- `EXTRA_LANGUAGE` in `app/src/main/java/com/vladiko/voicebridge/BridgeService.kt`
+- `tts?.setLanguage(...)` in the same file
+- `-l ru` in `server/transcribe.js`
+- `DEFAULT_VOICE` in `desktop/readback.py`
+
+The spoken commands (`отправляй`, `отбой`, …) are patterns in `BridgeService.kt` and
+`server/transcribe.js`; the on‑screen UI is Russian throughout.
 
 ## Honest limitations
 

@@ -1,0 +1,7 @@
+# Shell scripts and the gradle wrapper must reach Linux with LF endings —
+# a CRLF gradlew fails with "bad interpreter: /bin/sh^M".
+* text=auto eol=lf
+*.bat text eol=crlf
+*.jar binary
+*.png binary
+*.apk binary

@@ -1,0 +1,6 @@
+{
+  "url": "https://YOUR.SERVER.IP:8443",
+  "token": "the-token-install-relay.sh-printed",
+  "cacert": "cert.pem",
+  "voice": "ru-RU-DmitryNeural"
+}

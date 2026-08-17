@@ -12,12 +12,24 @@ const CFG = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
 const AUDIO_DIR = path.join(DIR, 'audio');
 const UTT_DIR = path.join(DIR, 'utt');   // raw dictation segments awaiting whisper
 const LOG = path.join(DIR, 'relay.log');
-if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
-if (!fs.existsSync(UTT_DIR)) fs.mkdirSync(UTT_DIR, { recursive: true });
+// 0700: these hold recorded speech and synthesized answers — not for other users of the box
+if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true, mode: 0o700 });
+if (!fs.existsSync(UTT_DIR)) fs.mkdirSync(UTT_DIR, { recursive: true, mode: 0o700 });
 
+// The log used to keep the first 60 characters of every message, forever and unrotated —
+// that is a transcript of your conversations sitting on the server. Default is now the
+// length only; set "logText": true in config.json when you are actually debugging.
+const LOG_TEXT = CFG.logText === true;
+const peek = (t) => (LOG_TEXT ? String(t).slice(0, 60) : `${String(t).length} chars`);
+
+// Keep the log bounded: rotate at 5 MB, keep one previous file.
+const LOG_MAX = 5 * 1024 * 1024;
 function log(m) {
   const line = `[${new Date().toISOString()}] ${m}\n`;
-  try { fs.appendFileSync(LOG, line); } catch (_) {}
+  try {
+    if (fs.existsSync(LOG) && fs.statSync(LOG).size > LOG_MAX) fs.renameSync(LOG, `${LOG}.1`);
+    fs.appendFileSync(LOG, line);
+  } catch (_) {}
   process.stdout.write(line);
 }
 
@@ -136,7 +148,7 @@ function handler(req, res) {
         const subs = sessions.get(sid);
         let n = 0;
         if (subs) for (const ws of subs) if (ws.readyState === 1) { ws.send(`[ГОЛОС С ТЕЛЕФОНА] ${text}`); n++; }
-        log(`say -> ${sid.slice(0, 8)}: ws ${n}, queued ${q.length}, ${text.slice(0, 60)}`);
+        log(`say -> ${sid.slice(0, 8)}: ws ${n}, queued ${q.length}, ${peek(text)}`);
         send(200, { ok: true, ws: n, queued: q.length, unread: !readerFresh(sid) });
       });
       return;
@@ -192,7 +204,7 @@ function handler(req, res) {
           const subs = sessions.get(sid);
           let n = 0;
           if (subs) for (const ws of subs) if (ws.readyState === 1) { ws.send(`[ГОЛОС С ТЕЛЕФОНА] ${text}`); n++; }
-          log(`uttdone -> ${sid.slice(0, 8)}: ws ${n}, queued ${queued}, ${text.slice(0, 60)}`);
+          log(`uttdone -> ${sid.slice(0, 8)}: ws ${n}, queued ${queued}, ${peek(text)}`);
         }
         // v0.36: honest event types. utt_lost = text existed but was NOT routed anywhere
         // (no session id, or the inbox map is full) — the phone used to hear a confident

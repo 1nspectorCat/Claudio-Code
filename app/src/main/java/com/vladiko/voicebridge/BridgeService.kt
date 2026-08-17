@@ -657,7 +657,7 @@ class BridgeService : Service() {
     private val cuePlayWhenReady: MutableSet<String> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
-    // Имена проектов приходят слагами (voicebridge_app) — озвучка читает подчёркивания вслух.
+    // Имена проектов приходят слагами (my_project) — озвучка читает подчёркивания вслух.
     private fun spoken(n: String) = n.replace('_', ' ').replace('-', ' ')
 
     // Произнести произвольную фразу громким путём: есть файл — играем, нет — синтезируем

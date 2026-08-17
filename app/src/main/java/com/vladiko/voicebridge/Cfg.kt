@@ -163,6 +163,16 @@ object SessionBook {
 
     // v1.06 (слово юзера: «удалил лишние, а как теперь ВЕРНУТЬ канал в список?»):
     // снимаем все метки удаления — при ближайшем обновлении с сервера каналы вернутся.
+    // v1.09: вернуть ОДИН канал (галочка в режиме правки списка)
+    fun unforget(ctx: Context, sid: String) {
+        try {
+            ctx.getSharedPreferences("bridge", Context.MODE_PRIVATE).edit()
+                .remove("forgot_$sid").apply()
+        } catch (_: Exception) {}
+    }
+
+    fun isForgotten(ctx: Context, sid: String): Boolean = forgotTs(ctx, sid) > 0
+
     fun unforgetAll(ctx: Context) {
         try {
             val p = ctx.getSharedPreferences("bridge", Context.MODE_PRIVATE)
@@ -172,7 +182,7 @@ object SessionBook {
         } catch (_: Exception) {}
     }
 
-    private fun forgotTs(ctx: Context, sid: String): Long =
+    fun forgotTs(ctx: Context, sid: String): Long =
         ctx.getSharedPreferences("bridge", Context.MODE_PRIVATE).getLong("forgot_$sid", 0L)
     fun all(): List<Entry> = map.values.sortedByDescending { it.lastTs }
     fun setMuted(ctx: Context, sid: String, m: Boolean) {

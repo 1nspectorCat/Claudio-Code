@@ -113,6 +113,8 @@ class MainActivity : AppCompatActivity() {
     private val feedExpanded = HashSet<String>() // точечные раскрытия тапом (XOR с общим)
     private val aliveMap = HashMap<String, Boolean>()
     private var sheetShowAll = false
+    private var sheetEditMode = false                       // v1.09: правка списка галочками
+    private val serverSids = LinkedHashMap<String, String>() // sid -> имя, всё что знает релей
     private var sheetMode = "channels"   // чем занята шторка: "channels" | "held"
     private var lastSheetTick = 0L       // v0.79: живое обновление открытого списка каналов
     private var lastSessionsFetch = 0L
@@ -268,19 +270,20 @@ class MainActivity : AppCompatActivity() {
             if (::onboardOverlay.isInitialized) onboardOverlay.visibility = View.GONE
             return
         }
-        // Ссылку может подсунуть любой сайт/QR (BROWSABLE): молчаливая замена релея на
-        // настроенном телефоне = угон диктовки. Замена — только с подтверждением руками.
-        if (Cfg.token.isNotEmpty() && (url != Cfg.url || token != Cfg.token)) {
-            val host = Uri.parse(url).host ?: url
-            LogBus.add("ссылка-настройка: прошу подтвердить замену релея на «${host}»")
-            androidx.appcompat.app.AlertDialog.Builder(this)
-                .setMessage("заменить настройки релея на «${host}»?\nвся диктовка пойдёт на этот сервер.")
-                .setPositiveButton("заменить") { _, _ -> applyDeepLink(url, token, pin) }
-                .setNegativeButton("отмена") { _, _ -> LogBus.add("замена релея отклонена") }
-                .show()
-            return
-        }
-        applyDeepLink(url, token, pin)
+        // Ссылку может подсунуть любой сайт/QR (BROWSABLE): молчаливая настройка релея =
+        // угон диктовки. Спрашиваем ВСЕГДА, в том числе на чистой установке — там чужая
+        // ссылка опаснее всего: человек ещё не знает, какой адрес у него должен быть.
+        val host = Uri.parse(url).host ?: url
+        val fresh = Cfg.token.isEmpty()
+        LogBus.add("ссылка-настройка: прошу подтвердить сервер «${host}»")
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setMessage(
+                if (fresh) "подключить рацию к серверу «${host}»?\nвся диктовка пойдёт туда.\nэто твой сервер?"
+                else "заменить настройки релея на «${host}»?\nвся диктовка пойдёт на этот сервер."
+            )
+            .setPositiveButton(if (fresh) "подключить" else "заменить") { _, _ -> applyDeepLink(url, token, pin) }
+            .setNegativeButton("отмена") { _, _ -> LogBus.add("настройка по ссылке отклонена") }
+            .show()
     }
 
     private fun applyDeepLink(url: String, token: String, pin: String) {
@@ -1052,16 +1055,15 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 0, 1f))
-            // v1.06: вернуть в список каналы, удалённые долгим тапом
-            addView(tv("↺ вернуть", 12.5f, cDim).apply {
+            // v1.09 (слово юзера: «вернуть нужны не все, а конкретные — галочками»)
+            addView(tv("✎ править список", 12.5f, cDim).apply {
                 background = bordered(10)
                 setPadding(dp(12), dp(6), dp(12), dp(6))
-                contentDescription = "вернуть удалённые каналы"
+                contentDescription = "выбрать галочками, какие каналы держать в списке"
                 setOnClickListener {
-                    SessionBook.unforgetAll(this@MainActivity)
-                    lastSessionsFetch = 0L
-                    fetchSessions()
-                    LogBus.add("метки удаления сняты — каналы вернутся из списка сервера")
+                    sheetEditMode = !sheetEditMode
+                    if (sheetEditMode) { lastSessionsFetch = 0L; fetchSessions() }
+                    rebuildSheet()
                 }
             })
             // v1.03 (слово юзера: «не вижу кнопку обновления списка каналов»)
@@ -1192,6 +1194,7 @@ class MainActivity : AppCompatActivity() {
                     if (arr != null) for (i in 0 until arr.length()) {
                         val o = arr.getJSONObject(i)
                         parsed.add(Triple(o.getString("sid"), o.optString("proj"), o.optLong("lastTs")))
+                        serverSids[o.getString("sid")] = o.optString("proj")
                         aliveMap[o.getString("sid")] = o.optBoolean("alive")
                     }
                 }
@@ -1232,6 +1235,59 @@ class MainActivity : AppCompatActivity() {
             })
         }
         val prefs = getSharedPreferences("bridge", MODE_PRIVATE)
+
+        // v1.09: режим правки — ВСЕ каналы, которые знает сервер, с галочками
+        if (sheetEditMode) {
+            sheetList.addView(tv("отметь, какие каналы держать в списке", 11f, cFaint).apply {
+                setPadding(dp(2), dp(6), dp(2), dp(8))
+            })
+            val known = LinkedHashMap<String, String>()
+            for (e in list) known[e.sid] = e.proj.ifEmpty { e.sid.take(8) }
+            for ((sid, nm) in serverSids) if (!known.containsKey(sid)) known[sid] = nm.ifEmpty { sid.take(8) }
+            if (known.isEmpty()) {
+                sheetList.addView(tv("сервер пока не отдал ни одного канала", 12f, cFaint))
+            }
+            for ((sid, nm) in known) {
+                val inList = list.any { it.sid == sid }
+                val row = LinkedHashMap<String, String>()   // placeholder to keep style
+                val line = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(4), dp(10), dp(4), dp(10))
+                }
+                line.addView(tv(if (inList) "☑" else "☐", 17f, if (inList) cPlay else cFaint).apply {
+                    setPadding(0, 0, dp(10), 0)
+                })
+                line.addView(tv(nm, 14f, if (inList) cText else cDim).apply {
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                line.setOnClickListener {
+                    if (inList) {
+                        if (BridgeService.instance?.picked()?.contains(sid) == true)
+                            BridgeService.instance?.togglePicked(sid)
+                        SessionBook.forget(this@MainActivity, sid)
+                        LogBus.add("канал убран из списка: $nm")
+                    } else {
+                        SessionBook.unforget(this@MainActivity, sid)
+                        SessionBook.seen(this@MainActivity, sid, nm, System.currentTimeMillis())
+                        LogBus.add("канал возвращён в список: $nm")
+                    }
+                    rebuildSheet()
+                }
+                sheetList.addView(line, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                sheetList.addView(View(this).apply { setBackgroundColor(cLine) },
+                    LinearLayout.LayoutParams(MATCH_PARENT, 1))
+            }
+            sheetList.addView(tv("✓ готово", 13f, cPlay).apply {
+                background = bordered(10)
+                gravity = Gravity.CENTER
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setOnClickListener { sheetEditMode = false; rebuildSheet() }
+            }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(12) })
+            return
+        }
+
         val shown = if (sheetShowAll) list else list.take(8)
         for (e in shown) {
             val row = LinearLayout(this).apply {
