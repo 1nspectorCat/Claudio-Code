@@ -10,7 +10,10 @@ are busy, and your agents on the desktop keep finishing tasks and asking questio
 > **Android 8+ only** — there is no iOS version and none is planned.
 > **Russian speech only** — recognizer, voice, spoken commands and UI are Russian
 > (see [Using another language](#using-another-language)).
-> **Your own Linux server required** — there is no hosted service, by design.
+> **Self-hosted** — there is no shared cloud. At home your own computer is enough;
+> going outdoors needs a machine with a public address (see [Do I need a server?](#do-i-need-a-server)).
+
+![How it works](docs/how-it-works.png)
 
 ---
 
@@ -33,11 +36,27 @@ are busy, and your agents on the desktop keep finishing tasks and asking questio
 ## What you need
 
 - An **Android phone** (Android 8+). Bluetooth headset with a button is a plus, not a must.
-- A **Linux server** you control (the cheapest VPS is fine) with **Node.js 18+**,
-  `openssl` and `curl`. Optional: `qrencode` (prints the setup QR in the terminal),
-  `pm2` (keeps the relay running across reboots).
+- **Somewhere to run the relay** — your own computer for home use, or any cheap VPS to
+  use it outdoors. Needs **Node.js 18+**, `openssl` and `curl`. Optional: `qrencode`
+  (prints the setup QR in the terminal), `pm2` (restarts the relay after a reboot).
 - **Claude Code** on your desktop (Windows/macOS/Linux) with **Python 3**,
   **`pip install edge-tts`**, **ffmpeg** and **curl** available on PATH.
+
+### Do I need a server?
+
+Depends on where you want to use it.
+
+**At home, on your own Wi-Fi: no.** The relay is a small Node process — run it on the
+same computer as Claude Code and point the phone at that machine's local address. That
+is how this project started.
+
+**Outdoors: yes.** Your computer sits behind the router and is not reachable from the
+mobile network, so the phone has nowhere to knock. Any cheap VPS works, and so does a
+tunnel (Tailscale, cloudflared) if you would rather not rent one. This is the case the
+whole thing was built for, which is why the instructions assume it.
+
+Either way the relay is yours: no shared service, no account, no audio passing through
+anyone else's machine.
 
 ## Setup
 

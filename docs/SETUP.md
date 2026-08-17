@@ -13,7 +13,16 @@ modes — the phone never talks to your computer directly.
 
 ## 1. Server
 
-Any Linux box with a public IP. Requirements: Node.js 18+, `openssl`, `curl`.
+Requirements: Node.js 18+, `openssl`, `curl`.
+
+**Home-only setup:** run the relay on the same computer as Claude Code (Linux, macOS or
+Windows) and give the phone that machine's LAN address — `IP=192.168.x.x bash install-relay.sh`.
+No VPS, no rented anything. The catch is that it only works while the phone is on the same
+Wi-Fi.
+
+**Outdoor setup:** you need an address reachable from the mobile network — the cheapest VPS
+is fine, and a tunnel (Tailscale, cloudflared) to your home machine also works. Everything
+below assumes a VPS, but the steps are the same on any machine.
 
 ### Scripted
 
