@@ -33,7 +33,7 @@ Monitor(
   description: "voice bridge: spoken replies from the phone",
   persistent: true,
   timeout_ms: 3600000,
-  command: D=~/.claude/voice/inbox; L=~/.claude/voice/bridge_life.log; mkdir -p "$D"; SID=<SESSION_ID>; NF="/tmp/vb_nonce_$SID.txt"; T0=$(date +%s); date +%s%N > "$NF"; NONCE=$(cat "$NF"); printf '%s ARMED %s\n' "$(date -u +%FT%TZ)" "$SID" >> "$L"; R=unknown; while :; do [ "$(cat "$NF" 2>/dev/null)" = "$NONCE" ] || { R=nonce-superseded; break; }; AGE=$(( $(date +%s) - T0 )); [ $AGE -lt 21600 ] || { R=six-hour-timer; break; }; out=$(curl -s -m 8 --cacert ~/.claude/voice/bridge/cert.pem "<URL>/consume?token=<TOKEN>&session=$SID" || true); if [ -n "$out" ]; then F="msg_${SID}_$(date +%s%N).txt"; printf '%s\n' "$out" > "$D/$F"; printf 'VOICE_MSG %s/%s\n' "$D" "$F" || { R=dead-pipe; break; }; fi; sleep 3; done; printf '%s DIED %s reason=%s lived=%ss\n' "$(date -u +%FT%TZ)" "$SID" "$R" "$(( $(date +%s) - T0 ))" >> "$L"
+  command: D=~/.claude/voice/inbox; L=~/.claude/voice/bridge_life.log; mkdir -p "$D"; SID=<SESSION_ID>; NF="/tmp/vb_nonce_$SID.txt"; BRIDGE_T0=$(date +%s); date +%s%N > "$NF"; NONCE=$(cat "$NF"); printf '%s ARMED %s\n' "$(date -u +%FT%TZ)" "$SID" >> "$L"; R=unknown; while :; do [ "$(cat "$NF" 2>/dev/null)" = "$NONCE" ] || { R=nonce-superseded; break; }; AGE=$(( $(date +%s) - BRIDGE_T0 )); [ $AGE -lt 21600 ] || { R=six-hour-timer; break; }; out=$(curl -s -m 8 --cacert ~/.claude/voice/bridge/cert.pem "<URL>/consume?token=<TOKEN>&session=$SID" || true); if [ -n "$out" ]; then F="msg_${SID}_$(date +%s%N).txt"; printf '%s\n' "$out" > "$D/$F"; printf 'VOICE_MSG %s/%s\n' "$D" "$F" || { R=dead-pipe; break; }; fi; sleep 3; done; printf '%s DIED %s reason=%s lived=%ss\n' "$(date -u +%FT%TZ)" "$SID" "$R" "$(( $(date +%s) - BRIDGE_T0 ))" >> "$L"
 )
 ```
 
@@ -48,14 +48,27 @@ Monitor(
   Key the nonce by SESSION ID, not by project — one project can hold several sessions.
 - **Dead pipe.** Printing with `|| exit` kills a loop whose parent is gone.
 - **Six-hour self-expiry.** A zombie that escaped both guards still dies on its own.
-  Count with your own `T0`, never with `$SECONDS`: that is the age of the *shell*, which
+  Count with your own `BRIDGE_T0`, never with `$SECONDS`: that is the age of the *shell*, which
   the harness reuses. In a long session `$SECONDS` is already past six hours and every
   fresh loop dies on its first iteration — the bridge looks armed and is in fact dead.
+  Give that variable a long, unique name: a short `T0` can already exist in the reused shell,
+  and the fresh loop then inherits a stale value and dies immediately, logging "lived 21600s"
+  one second after it started. After arming, check the life log for an ARMED line with a
+  current timestamp — two seconds of verification against an hour of silent breakage.
 - **Text travels as a file.** A background console mangles non-ASCII on stdout (Cyrillic
   came out as `????`). The event line carries only an ASCII path; the text is UTF-8 in
   the file. Delete the file after reading it, or the next arming replays the message.
 - **Life log.** Every arming and death writes a line with the reason, so "the bridge died"
   can be diagnosed instead of guessed.
+
+## If Monitor expires after 30 minutes
+
+Some Claude Code versions stop a Monitor after 30 minutes. Re-arming it in a loop wakes the session
+for nothing and burns usage. Instead run the same loop with Bash `run_in_background: true`, and make
+it exit on the first message: in the `if [ -n "$out" ]` branch, after printing the path, write the
+reason to the life log and `break`. The session wakes on the task-completion notice, reads the file,
+handles it, deletes it and arms the loop again. Nonce, six-hour timer and life log stay the same.
+Messages that arrive during the few seconds of re-arming wait in the relay queue and are not lost.
 
 ## Handling events
 

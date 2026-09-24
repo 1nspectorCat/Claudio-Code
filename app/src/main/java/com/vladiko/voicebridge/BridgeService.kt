@@ -319,7 +319,8 @@ class BridgeService : Service() {
                 AudioManager.AUDIOFOCUS_LOSS -> {
                     if (!playing && !paused) return@post
                     LogBus.add("звук забрало другое приложение — пауза (кнопка продолжит, сам — через 90с)")
-                    val pos = if (paused) pausedAtMs else (try { player?.currentPosition ?: 0 } catch (_: Exception) { 0 })
+                    val pos = if (paused) pausedAtMs else if (cueHold) cueHoldAtMs else (try { player?.currentPosition ?: 0 } catch (_: Exception) { 0 })
+                    cueHold = false
                     try { player?.stop() } catch (_: Exception) {}
                     try { player?.release() } catch (_: Exception) {}
                     player = null
@@ -657,7 +658,7 @@ class BridgeService : Service() {
     private val cuePlayWhenReady: MutableSet<String> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
-    // Имена проектов приходят слагами (voicebridge_app) — озвучка читает подчёркивания вслух.
+    // Имена проектов приходят слагами (my_project) — озвучка читает подчёркивания вслух.
     private fun spoken(n: String) = n.replace('_', ' ').replace('-', ' ')
 
     // Произнести произвольную фразу громким путём: есть файл — играем, нет — синтезируем
@@ -796,27 +797,41 @@ class BridgeService : Service() {
     // отправки микрофон и не знал об этом. Сон обязан быть слышен, и в той же реплике должно
     // звучать, КУДА ушло: два вопроса, которые он задавал вслух каждый раз. Одной фразой,
     // потому что вторая реплика подряд обрывает первую (cuePlayer один).
-    private fun sentBasePhrase(): String {
-        val n = replyTargetName()
+    // ревью v1.15: пока играет ответ, playNext уже переставил lastSession на говорящий канал,
+    // и «ушло в X» по адресату называло ЕГО, а не тот, куда ушло сообщение. Имя берём по sid
+    // самого сообщения; без sid (прогрев) — по адресату, как прежде.
+    private fun sentBasePhrase(sid: String = ""): String {
+        val n = if (sid.isNotEmpty())
+            SessionBook.all().firstOrNull { it.sid == sid }?.proj.orEmpty()
+        else replyTargetName()
         return if (n.isEmpty() || n == "—") "ушло" else "ушло в " + spoken(n)
+    }
+
+    // Поверх звучащего ответа — только фраза, которая уже лежит файлом: иначе она уйдёт в
+    // синтез или живой TTS, а живой TTS удержание не ставит и звучит поверх ответа.
+    private fun sentPhraseOverAnswer(sid: String): String {
+        val full = sentBasePhrase(sid)
+        val f = cueFiles[full]
+        return if (f != null && f.exists() && f.length() > 200) full else "ушло"
     }
 
     // v0.83 (боевое: «ушло в X… слушаю… мета судья… — каша из фраз подряд»). Когда сразу
     // за отправкой играет ответ ДРУГОГО канала, три реплики склеиваются в одну, а имя
     // канала перед озвучкой не повторяется (announcedMsgId ставится заранее).
-    private fun sentPhraseWithNext(): String {
-        val base = sentBasePhrase()
+    private fun sentPhraseWithNext(sid: String = ""): String {
+        val base = sentBasePhrase(sid)
         val nxt = playQueue.firstOrNull() ?: return base
         val nsid = nxt.optString("session")
-        if (nsid.isEmpty() || nsid == Cfg.replyTarget.ifEmpty { lastSession ?: "" }) return base
+        val sentTo = sid.ifEmpty { Cfg.replyTarget.ifEmpty { lastSession ?: "" } }
+        if (nsid.isEmpty() || nsid == sentTo) return base
         val nname = nxt.optString("proj").ifEmpty { nsid.take(8) }
         val mid = nxt.optString("msgid")
         if (mid.isNotEmpty()) { announcedMsgId = mid; announcedProj = nname }
         return base + ". дальше " + spoken(nname)
     }
 
-    private fun sentCuePhrase(): String =
-        if (micAsleep) sentBasePhrase() + ". микрофон спит" else sentBasePhrase()
+    private fun sentCuePhrase(sid: String = ""): String =
+        if (micAsleep) sentBasePhrase(sid) + ". микрофон спит" else sentBasePhrase(sid)
 
     // Обе формы «ушло» готовим заранее: какая понадобится, зависит от того, уснёт ли микрофон,
     // а на живом TTS реплика звучит тихо — ровно то, чего юзер на улице не слышит.
@@ -890,9 +905,7 @@ class BridgeService : Service() {
             // системные фразы»): на паузе реплика ждёт в очереди и прозвучит, когда ты
             // сам снимешь паузу. Раньше она играла поверх тишины и ломала ожидание.
             if (paused) {
-                if (cueQueue.size < 4 && cueQueue.none { it.absolutePath == f.absolutePath }) {
-                    cueQueue.addLast(f)
-                }
+                queueCue(f)
                 return@post
             }
             // v0.39 (боевое «от слова слушаю слышны последние три буквы»): SCO-маршрут
@@ -930,9 +943,7 @@ class BridgeService : Service() {
             // делал release() играющей фразы — и до уха доходил огрызок, часто самый
             // бесполезный из трёх. Потолок 6с на фразу: залипшая не имеет права держать всё.
             if (cuePlayer != null && System.currentTimeMillis() - ttsSpeakStartTs < 6000) {
-                if (cueQueue.size < 4 && cueQueue.none { it.absolutePath == f.absolutePath }) {
-                    cueQueue.addLast(f)
-                }
+                queueCue(f)
                 return@post
             }
             try { cuePlayer?.release() } catch (_: Exception) {}
@@ -970,6 +981,11 @@ class BridgeService : Service() {
                         try { mp.release() } catch (_: Exception) {}
                         if (cuePlayer === mp) cuePlayer = null
                         unduckPlayer()
+                        // v1.13 (аудит): годность файла проверялась одним размером (>200 байт),
+                        // и обрезанный wav — синтез убит на середине — проходил проверку вечно:
+                        // фраза немела НАВСЕГДА, переживая перезапуски (кэш лежит в cacheDir).
+                        // Кэш самолечится: битый файл выбрасываем, следующий вызов пересинтезирует.
+                        dropBadCue(f)
                         cueQueue.poll()?.let { nx -> playCueFile(nx) }
                     }
                     true
@@ -986,20 +1002,103 @@ class BridgeService : Service() {
                 // как делает автомобильная навигация: ответ уходит на четверть громкости и
                 // возвращается сам. Глушить нельзя (порвём поток A2DP и потеряем кнопку), а
                 // молчать реплике — значит потерять «ушло» и имя адресата.
-                if (playing && !paused) try { player?.setVolume(0.25f, 0.25f) } catch (_: Exception) {}
+                if (playing && !paused) holdAnswerForCue()
             } catch (e: Exception) {
                 ttsSpeaking = false
                 lastTtsEndTs = System.currentTimeMillis()
                 unduckPlayer()
+                dropBadCue(f)                                    // v1.13: см. onErrorListener
                 cueQueue.poll()?.let { nx -> playCueFile(nx) }   // очередь не должна вставать
             }
         }
     }
 
+    // v1.13 (аудит): при переполнении очередь выбрасывала НОВУЮ фразу, а старые протухшие
+    // («слушаю», «есть ответы») держались до конца — то есть терялось как раз то, что важнее
+    // всего, обычно подтверждение отправки. Теперь вытесняем самую старую и говорим об этом
+    // в журнал. Подтверждение «ушло» не дедуплицируем: две отправки подряд — два подтверждения.
+    // Выбросить негодный файл реплики из кэша: и с диска, и из карты имён — иначе
+    // ensureCue/prewarmCues увидят «файл есть, больше 200 байт» и не пересинтезируют.
+    private fun dropBadCue(f: File) {
+        try {
+            val key = cueFiles.entries.firstOrNull { it.value.absolutePath == f.absolutePath }?.key
+            if (key != null) cueFiles.remove(key)
+            if (f.exists()) f.delete()
+            LogBus.add("битый файл реплики выброшен — пересинтезирую при следующей")
+        } catch (_: Exception) {}
+    }
+
+    private fun queueCue(f: File) {
+        val isSent = cueFiles.entries.any { it.key.startsWith("ушло") && it.value.absolutePath == f.absolutePath }
+        if (!isSent && cueQueue.any { it.absolutePath == f.absolutePath }) return
+        if (cueQueue.size >= 4) {
+            cueQueue.poll()
+            LogBus.add("очередь реплик полна — выбросил самую старую")
+        }
+        cueQueue.addLast(f)
+    }
+
+    // v1.13 (аудит реплик, blocker): очередь реплик сливалась ТОЛЬКО из onCompletion уже
+    // играющей реплики. На паузе playCueFile ничего не запускает — значит фразы копились
+    // в очереди и не выходили НИКОГДА: снятие паузы её не трогало. Так молча пропадали
+    // «ушло в X», «канал не слушает», «отбой, стёрто». Хуже: непустая очередь навсегда
+    // запрещала сторожу поднять микрофон гарнитуры (гейт на 30-секундном тике — без потолка).
+    private fun flushCueQueue() {
+        if (cuePlayer == null && !paused) cueQueue.poll()?.let { playCueFile(it) }
+    }
+
     // Вернуть громкость ответа после реплики. В паузе НЕ трогаем: там ноль — это и есть пауза
     // (пауза сделана заглушением намеренно, остановленный плеер рвёт поток и убивает кнопку).
     private fun unduckPlayer() {
-        if (!paused) try { player?.setVolume(1f, 1f) } catch (_: Exception) {}
+        if (!cueHold) {
+            if (!paused) try { player?.setVolume(1f, 1f) } catch (_: Exception) {}
+            return
+        }
+        if (cueQueue.isNotEmpty()) return   // следующая реплика продолжит держать ответ
+        releaseCueHold()
+    }
+
+    private fun holdAnswerForCue() {
+        if (cueHold) {
+            // следующая реплика цепочки: позицию не трогаем, но сторож считает от неё
+            cueHoldSince = System.currentTimeMillis()
+            armCueHoldGuard()
+            return
+        }
+        // ревью v1.15 (блокер): между частями ответа playing=true, а в player лежит уже
+        // доигравший кусок. Удержание на нём переигрывало старый ответ или съедало начало
+        // нового. Держим только реально звучащий ответ; новую часть переякорит playFile.
+        val p = player ?: return
+        if (currentFile == null || !(try { p.isPlaying } catch (_: Exception) { false })) return
+        try {
+            cueHoldAtMs = p.currentPosition
+            player?.setVolume(0f, 0f)
+            cueHold = true
+            cueHoldSince = System.currentTimeMillis()
+            armCueHoldGuard()
+        } catch (_: Exception) {}
+    }
+
+    // Страховка: залипшая реплика не имеет права держать ответ в тишине вечно.
+    private fun armCueHoldGuard() {
+        main.postDelayed({
+            if (cueHold && System.currentTimeMillis() - cueHoldSince >= 12000) {
+                LogBus.add("реплика держала ответ дольше 12с — отпускаю")
+                releaseCueHold()
+            }
+        }, 12000)
+    }
+
+    private fun releaseCueHold() {
+        if (!cueHold) return
+        cueHold = false
+        if (paused) return                  // пауза уже забрала позицию себе (pausePlayback)
+        try {
+            player?.let {
+                it.seekTo(cueHoldAtMs)
+                fadeIn(it)   // без щелчка чужого слога на асинхронном seekTo
+            }
+        } catch (_: Exception) {}
     }
 
     // v0.31 (требование юзера: «кнопки должны работать В ПАРЕ с микрофоном гарнитуры, без
@@ -1176,7 +1275,8 @@ class BridgeService : Service() {
         // просто перекидывал озвучку в ГРОМКИЙ ДИНАМИК на улице. Теперь ответ никогда не
         // доигрывает вслух сам: onlyHeadset=true — часть в очередь до наушников (как раньше),
         // иначе — «пауза потери наушников»: продолжит кнопка или вернувшиеся наушники.
-        val pos = if (paused) pausedAtMs else (try { player?.currentPosition ?: 0 } catch (_: Exception) { 0 })
+        val pos = if (paused) pausedAtMs else if (cueHold) cueHoldAtMs else (try { player?.currentPosition ?: 0 } catch (_: Exception) { 0 })
+        cueHold = false
         try { player?.stop() } catch (_: Exception) {}
         try { player?.release() } catch (_: Exception) {}
         player = null
@@ -1187,6 +1287,7 @@ class BridgeService : Service() {
             currentFile = null
             playing = false
             paused = false   // v0.14: иначе пауза переживает потерю наушников и намертво держит очередь
+            flushCueQueue()  // v1.13: реплики, отложенные паузой, обязаны выйти
             main.removeCallbacks(unpauseGuard)
             abandonFocus()
             LogBus.add("наушники отключились — жду наушники")
@@ -1516,7 +1617,9 @@ class BridgeService : Service() {
 
     fun pausePlayback() {
         paused = true
-        pausedAtMs = try { player?.currentPosition ?: 0 } catch (_: Exception) { 0 }
+        pausedAtMs = if (cueHold) cueHoldAtMs
+            else try { player?.currentPosition ?: 0 } catch (_: Exception) { 0 }
+        cueHold = false
         try { player?.setVolume(0f, 0f) } catch (_: Exception) {}
         main.postDelayed(unpauseGuard, 90000)
         // v0.13 (боевое: «в паузу входит, а обратно — вообще никак»): объявлять системе STATE_PAUSED
@@ -1532,13 +1635,23 @@ class BridgeService : Service() {
     fun resumePlayback() {
         paused = false
         main.removeCallbacks(unpauseGuard)
+        // v1.15 (ревью): реплики, отложенные паузой, выйдут сейчас — ответ встаёт на удержание
+        // С ТОЧКИ ПАУЗЫ до их конца. Иначе он заиграл бы вместе с фразой, а удержание взяло бы
+        // позицию, до которой плеер успел уйти в тишине.
+        if (currentFile != null && (cuePlayer != null || cueQueue.isNotEmpty()) && !cueHold) {
+            cueHoldAtMs = pausedAtMs
+            cueHold = true
+            cueHoldSince = System.currentTimeMillis()
+            armCueHoldGuard()
+        }
+        flushCueQueue()      // v1.13: на паузе реплики копились и НИКОГДА не выпускались
         grabMediaButtons()   // v0.12: вернуть состояние PLAYING и приоритет кнопки
         // v0.14: плеера может уже не быть (озвучка успела кончиться, наушники моргнули).
         // v0.29: но файл-то известен — переигрываем ЕГО с точки паузы, а не проматываем очередь.
         var ok = try {
             player?.let {
                 it.seekTo(pausedAtMs)          // v0.15: вернуться туда, где остановились
-                it.setVolume(1f, 1f)
+                if (!cueHold) it.setVolume(1f, 1f)   // v1.15: под фразой звук поднимет releaseCueHold
                 if (!it.isPlaying) it.start()
                 true
             } ?: false
@@ -1560,6 +1673,7 @@ class BridgeService : Service() {
     // v0.10 (слово юзера «хочу прервать озвучку и сразу начать диктовать»): thenListen сразу
     // поднимает микрофон — без второго нажатия. Пауза на устаканивание маршрута A2DP→SCO.
     fun stopPlayback(thenListen: Boolean = false) {
+        cueHold = false
         touchUser()
         playGen++   // v0.36: убить отложенные продолжения (докачка, routeWait) — иначе зомби-озвучка
         try { player?.stop() } catch (_: Exception) {}
@@ -1567,6 +1681,7 @@ class BridgeService : Service() {
         player = null
         currentFile = null
         paused = false
+        flushCueQueue()      // v1.13: см. resumePlayback — иначе отложенное молчит вечно
         currentSid = null
         playQueue.clear()
         fileQueue.clear()
@@ -2299,7 +2414,7 @@ class BridgeService : Service() {
                         Cfg.save(this)
                         LogBus.add("мёртвый адресат откреплён — отвечаю теперь в последнюю игравшую")
                         cue("адресат сброшен, повтори")
-                    } else if (System.currentTimeMillis() - lastUnreadCueTs > 60000) {
+                    } else if (System.currentTimeMillis() - lastUnreadCueTs > 10000) {
                         lastUnreadCueTs = System.currentTimeMillis()
                         cue("канал не слушает")
                         // v0.82: не добавлять «слушаю, X» поверх предупреждения (каша из фраз).
@@ -2331,7 +2446,21 @@ class BridgeService : Service() {
                 if (!o.optBoolean("unread")) {
                     val queuedNow = playQueue.isNotEmpty() || fileQueue.isNotEmpty()
                     // «звук реально слышен» = playing && !paused (пауза — это заглушение, v0.15)
-                    if (!playing || paused) cue(if (queuedNow) sentPhraseWithNext() else sentCuePhrase())
+                    val busy = playing && !paused
+                    // v1.13 (боевое, слово юзера: «две сессии ответили, я ответил в первую —
+                    // и не услышал, что ушло: сразу пошла озвучка второй»). Гейт v0.73 молчал
+                    // при играющей озвучке, потому что тогда реплика ложилась ПОВЕРХ ответа.
+                    // С v0.58 реплика приглушает ответ до четверти и возвращает громкость —
+                    // накладки больше нет, а молчание стоит дорого: подтверждение отправки это
+                    // ЕДИНСТВЕННЫЙ признак, что сообщение не потерялось.
+                    // v1.15: поверх ответа фраза звучит одна — ответ держится (holdAnswerForCue)
+                    // и продолжается с той же секунды; «ушло в X», если фраза уже готова файлом.
+                    val sentSid = o.optString("session")
+                    cue(when {
+                        busy -> sentPhraseOverAnswer(sentSid)   // v1.15: ответ держится, фраза в тишине
+                        queuedNow -> sentPhraseWithNext(sentSid)
+                        else -> sentCuePhrase(sentSid)
+                    })
                     buzz(180)
                 }
                 kickPlayback()
@@ -2345,7 +2474,12 @@ class BridgeService : Service() {
                 // „ничего не расслышал“»). Окно 12с оказалось мало: сервер отвечает по мере
                 // очереди whisper. Плюс главный признак — СПЯЩИЙ микрофон: если юзер не
                 // диктовал, эта пустота может быть только хвостом шума, и говорить о ней нечего.
-                val justSent = micAsleep || System.currentTimeMillis() - lastSendOkTs < 30000
+                // v1.13 (аудит): признак «это хвост шума, молчим» ловил и живую диктовку —
+                // нажал кнопку, наговорил, микрофон уснул, whisper на ветру не нашёл слов, и
+                // сообщение исчезало БЕЗ ЕДИНОГО СЛОВА. Хвост отличается тем, что после
+                // удачной отправки микрофон больше не поднимали.
+                val justSent = (micAsleep || System.currentTimeMillis() - lastSendOkTs < 30000) &&
+                    listenStartedAt <= lastSendOkTs
                 if (System.currentTimeMillis() - lastEmptyCueTs > 60000 && (!playing || paused) && !justSent) {
                     lastEmptyCueTs = System.currentTimeMillis()
                     cue("ничего не расслышал")   // v0.88/0.90: не поверх ответа и не сразу после «ушло»
@@ -2474,6 +2608,15 @@ class BridgeService : Service() {
     private var boundarySid: String? = null
     private var boundaryHoldUntil = 0L
     private val cueQueue = ArrayDeque<File>()   // v0.94: реплики договаривают по очереди
+    // v1.15 (слово юзера: «системная фраза и голос ответа звучат одновременно»; и раньше:
+    // «приглушения быть не должно — как будто отдали управление: сначала системное, потом
+    // сообщение»). Ответ под репликой больше не приглушается до четверти, а ДЕРЖИТСЯ:
+    // звук в ноль, позиция запомнена, после реплики — возврат ровно на эту секунду.
+    // Плеер при этом продолжает крутиться в тишине — останавливать его нельзя (урок v0.15:
+    // остановленный плеер рвёт A2DP, и кнопка гарнитуры умирает).
+    @Volatile private var cueHold = false
+    @Volatile private var cueHoldAtMs = 0
+    @Volatile private var cueHoldSince = 0L
     @Volatile private var cuePendingUntil = 0L // реплика ждёт устаканивания SCO — она ещё впереди
     @Volatile private var scoStoppedAt = 0L    // v0.97: когда канал гарнитуры начали гасить
     @Volatile private var cueWaitFrom = 0L     // с какого момента реплика ждёт конца записи
@@ -2915,6 +3058,15 @@ class BridgeService : Service() {
                             } catch (_: Exception) {}
                             return@post
                         }
+                        // v1.15: часть кончилась В ТИШИНЕ под репликой — следующую не начинаем
+                        // (она заиграла бы поверх фразы), а крутим эту с точки удержания.
+                        if (cueHold) {
+                            try {
+                                player?.seekTo(cueHoldAtMs)
+                                player?.start()
+                            } catch (_: Exception) {}
+                            return@post
+                        }
                         currentFile = null
                         playNext()
                     }
@@ -2930,6 +3082,16 @@ class BridgeService : Service() {
                 if (seekTo > 0) try { seekTo(seekTo) } catch (_: Exception) {}   // v0.29: продолжение с паузы
                 setVolume(0f, 0f)     // v0.27: без этого первый слог бьёт по уху на полной громкости
                 start()
+                // v1.15: ожидание реплики у kickPlayback ограничено 3с — если фраза ещё
+                // звучит, новая часть сразу встаёт на удержание с нуля и ждёт её конца
+                if (cueHold || cuePlayer != null) {   // ttsSpeaking гаснет от живого объявления, а файловая фраза ещё звучит
+                    cueHoldAtMs = seekTo      // точка — начало ЭТОЙ части, а не прежнего плеера
+                    if (!cueHold) {
+                        cueHold = true
+                        cueHoldSince = System.currentTimeMillis()
+                        armCueHoldGuard()
+                    }
+                }
                 fadeIn(this)
                 // v0.10 диагностика обрывов: видно, сколько раз стартовал плеер и что осталось
                 LogBus.add("играю часть (в очереди ещё ${playQueue.size + fileQueue.size})")
@@ -2955,7 +3117,7 @@ class BridgeService : Service() {
         for (i in 1..steps) {
             val v = i / steps.toFloat()
             main.postDelayed({
-                if (!alive || paused) return@postDelayed
+                if (!alive || paused || cueHold) return@postDelayed
                 try { if (player === mp) mp.setVolume(v, v) } catch (_: Exception) {}
             }, step * i)
         }
@@ -3576,7 +3738,17 @@ class BridgeService : Service() {
                 (if (!Cfg.autoSend) "&nosil=1" else "") + (if (fin) "&final=1" else ""))
             .post(body).build()
         // v0.36: после финала ждём подтверждение сервера — иначе смерть voice-whisper невидима
-        if (fin) main.post { if (alive) armUttAckTimer(u) }
+        // v1.13 (боевое: «ответил в первую сессию — и сразу пошла озвучка второй, а „ушло“ я не
+        // услышал»). Окно ожидания подтверждения ставил только sendNow, то есть ЭКРАННАЯ кнопка.
+        // Финал по стоп-слову, по тишине и по серверному решению его не ставил — и ждавший в
+        // очереди ответ стартовал раньше, чем приходило «ушло». Порядок должен быть жёстким:
+        // сначала системная фраза, потом чужой голос.
+        if (fin) main.post {
+            if (alive) {
+                armUttAckTimer(u)
+                awaitSendCueUntil = System.currentTimeMillis() + 6000
+            }
+        }
         http.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 main.post { if (alive) LogBus.add("сегмент не ушёл (" + (e.message?.take(30) ?: "?") + ") — повтор через 3с") }
@@ -4511,15 +4683,21 @@ class BridgeService : Service() {
                         val unread = try { JSONObject(respBody ?: "{}").optBoolean("unread") } catch (_: Exception) { false }
                         if (unread) {
                             LogBus.add("ВНИМАНИЕ: «${projLabel ?: sid.take(8)}» не забирает сообщения — сессия закрыта или приёмник умер. Текст ждёт в очереди")
-                            if (System.currentTimeMillis() - lastUnreadCueTs > 60000) {
+                            if (System.currentTimeMillis() - lastUnreadCueTs > 10000) {
                                 lastUnreadCueTs = System.currentTimeMillis()
                                 cue("канал не слушает")
                                 suppressListenCueUntil = System.currentTimeMillis() + 8000   // v0.82
                             }
                             buzz(400)
-                        } else if (!playing || paused) {
-                            // v0.83: с очередью — склейка «ушло в X. дальше Y», без неё — как было
-                            cue(if (queuedNow) sentPhraseWithNext() else sentCuePhrase())
+                        } else {
+                            // v1.13: подтверждение звучит ВСЕГДА (см. тот же фикс в utt_sent).
+                            // Раньше гейт `!playing || paused` глотал его, если в этот момент
+                            // играл ответ другого канала — юзер не знал, ушло ли сообщение.
+                            cue(when {
+                                playing && !paused -> sentPhraseOverAnswer(sid)   // v1.15: см. utt_sent
+                                queuedNow -> sentPhraseWithNext(sid)   // v0.83: «ушло в X. дальше Y»
+                                else -> sentCuePhrase(sid)
+                            })
                         }
                         try {
                             val vib = getSystemService(VIBRATOR_SERVICE) as? android.os.Vibrator

@@ -162,8 +162,23 @@ object SessionBook {
     // возвращалась бы сама. Канал вернётся, когда РЕАЛЬНО ответит что-то новое.
     fun forget(ctx: Context, sid: String) {
         map.remove(sid)
-        ctx.getSharedPreferences("bridge", Context.MODE_PRIVATE).edit()
-            .putLong("forgot_$sid", System.currentTimeMillis()).apply()
+        val p = ctx.getSharedPreferences("bridge", Context.MODE_PRIVATE)
+        val ed = p.edit().putLong("forgot_$sid", System.currentTimeMillis())
+        // v1.14 (боевое: «удалил тестовый канал из списка, а после перезапуска приложения он
+        // снова в шапке»). Удаление вычищало только СПИСОК, а следы канала оставались:
+        // «последняя игравшая сессия» в prefs и адресат в настройках. Экран берёт имя оттуда —
+        // и показывал канал, которого в списке уже нет.
+        if (p.getString("lastSession", "") == sid) ed.remove("lastSession")
+        ed.apply()
+        var cfgDirty = false
+        if (Cfg.replyTarget == sid) { Cfg.replyTarget = ""; cfgDirty = true }
+        if (Cfg.pickedSids.split(",").any { it.trim() == sid }) {
+            Cfg.pickedSids = Cfg.pickedSids.split(",").map { it.trim() }
+                .filter { it.isNotEmpty() && it != sid }.joinToString(",")
+            cfgDirty = true
+        }
+        if (Cfg.soloSid == sid) { Cfg.soloSid = ""; cfgDirty = true }
+        if (cfgDirty) Cfg.save(ctx)
         save(ctx)
     }
 

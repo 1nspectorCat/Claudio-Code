@@ -761,13 +761,15 @@ class MainActivity : AppCompatActivity() {
             val s = svc.replyTargetSid()
             if (s.isNotEmpty()) return s
         }
-        if (Cfg.replyTarget.isNotEmpty()) return Cfg.replyTarget
-        if (Cfg.pickedSids.isNotEmpty())
-            return Cfg.pickedSids.split(",").first().trim()
+        // v1.14: канал, убранный из списка руками, не должен всплывать в шапке — а он всплывал
+        // на каждом запуске приложения, потому что оставался адресатом или «последним игравшим».
+        fun ok(s: String) = s.isNotEmpty() && !SessionBook.isForgotten(this, s)
+        if (ok(Cfg.replyTarget)) return Cfg.replyTarget
+        Cfg.pickedSids.split(",").map { it.trim() }.firstOrNull { ok(it) }?.let { return it }
         // сервис выключен: движок персистит lastSession в prefs при каждом воспроизведении
         val last = getSharedPreferences("bridge", MODE_PRIVATE).getString("lastSession", "") ?: ""
-        if (last.isNotEmpty()) return last
-        return SessionBook.all().maxByOrNull { it.lastTs }?.sid.orEmpty()
+        if (ok(last)) return last
+        return SessionBook.all().filter { ok(it.sid) }.maxByOrNull { it.lastTs }?.sid.orEmpty()
     }
 
     private fun feedName(): String {

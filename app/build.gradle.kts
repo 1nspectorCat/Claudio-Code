@@ -30,8 +30,8 @@ android {
         targetSdk = 35
         // Single source of truth for the version: the app reads BuildConfig.VERSION_NAME.
         // Bump BOTH on every delivered build (Play requires a growing versionCode).
-        versionCode = 112
-        versionName = "1.12"
+        versionCode = 115
+        versionName = "1.15"
     }
 
     // Two builds from one codebase. "personal" is the owner's build: his relay baked in
