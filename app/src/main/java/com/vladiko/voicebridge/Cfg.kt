@@ -16,6 +16,8 @@ object Cfg {
     var token = ""
     var pin = DEF_PIN
     var handsFree = false
+    // voice off: the service stays connected (feed, channels, typing work), nothing plays, mic never rises
+    var voiceOff = false
     var autoSend = true     // v0.5: hands-free auto-send after silence (warn beep 4s, send 2s later)
     var btMic = true        // use headset (SCO/BLE) microphone for dictation
     var onlyHeadset = false // hold playback until headphones are connected
@@ -62,8 +64,9 @@ object Cfg {
         url = p.getString("url", DEF_URL) ?: DEF_URL
         token = p.getString("token", "") ?: ""
         pin = p.getString("pin", DEF_PIN) ?: DEF_PIN
-        handsFree = p.getBoolean("handsFree", false)
-        autoSend = p.getBoolean("autoSend", true)
+        handsFree = p.getBoolean("handsFree", BuildConfig.DEF_HANDSFREE)
+        voiceOff = p.getBoolean("voiceOff", false)
+        autoSend = p.getBoolean("autoSend", BuildConfig.DEF_AUTOSEND)
         btMic = p.getBoolean("btMic", true)
         onlyHeadset = p.getBoolean("onlyHeadset", false)
         autoRoute = p.getBoolean("autoRoute", true)
@@ -88,6 +91,7 @@ object Cfg {
             .putString("token", token.trim())
             .putString("pin", pin.trim())
             .putBoolean("handsFree", handsFree)
+            .putBoolean("voiceOff", voiceOff)
             .putBoolean("autoSend", autoSend)
             .putBoolean("btMic", btMic)
             .putBoolean("onlyHeadset", onlyHeadset)

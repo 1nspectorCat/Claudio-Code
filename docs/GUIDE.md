@@ -1,100 +1,110 @@
-# Claudio Code — как пользоваться
+# Claudio Code — how to use it
 
-Рация связывает телефон и сессии Claude Code на компьютере. Ты слушаешь ответы в наушнике
-и отвечаешь голосом; экран нужен только когда хочется вмешаться руками.
+<!-- DRAFT for the public repo (store build, English). Button and setting names must match
+     the English strings in MainActivity once the store build is checked on a phone. -->
 
-## Главный экран
+Claudio Code is a walkie-talkie between your phone and Claude Code sessions on your computer.
+You hear the replies in your earphones and answer by voice; the screen is only for when you
+want to step in by hand.
 
-**Лента-чат.** Сверху — разговор текущего канала: ответы канала слева, твои реплики справа
-с пометкой «ушло». Пузыри свёрнуты до трёх строк.
-- тап по пузырю — раскрыть или свернуть;
-- значок ▶ у ответа — послушать его;
-- долгий тап по ответу — играть с этого места и дальше;
-- стрелки в шапке (⤢) — раскрыть или свернуть всю переписку разом.
+## Main screen
 
-Переписка хранится и на телефоне: она переживает перезапуск сервера, где история живёт
-только в оперативной памяти.
+**Chat feed.** At the top is the conversation of the current channel: channel replies on the
+left, your messages on the right marked "sent". Bubbles are folded to three lines.
+- tap a bubble — expand or fold it;
+- the ▶ icon on a reply — listen to it;
+- long press a reply — play from that point on;
+- the arrows in the header (⤢) — expand or fold the whole conversation at once.
 
-**Круг — тангента и статус одновременно.** Цвет и подпись говорят, что происходит:
-- «на связи» — тап поднимает микрофон;
-- «слушаю» — говори; тап отправит сказанное;
-- «играю» — звучит ответ; тап ставит паузу, ещё тап — продолжает с того же места;
-- «ответить · имя» — идёт зазор между каналами, тап отвечает тому, кто договорил;
-- «ушло», «микрофон спит», «нет связи», «жду наушники» — по смыслу;
-- ДОЛГИЙ тап по кругу — включить или выключить рацию целиком.
+The conversation is also kept on the phone, so it survives a relay restart (the relay keeps
+history only in memory).
 
-Под кругом: подсказка (её ДОЛГИЙ тап переключает режим отправки — по тишине или только
-словом), кнопка «✕ отмена» во время диктовки и «🎙 прервать и говорить» во время озвучки.
+**The circle is both the talk button and the status.** Its colour and label tell you what is
+going on:
+- "online" — tap to open the microphone;
+- "listening" — speak; a tap sends what you said;
+- "playing" — a reply is playing; tap to pause, tap again to resume from the same spot;
+- "reply · name" — a gap between two channels; a tap answers the one that just finished;
+- "sent", "mic asleep", "offline", "waiting for headphones" — what they say;
+- LONG press on the circle — turn the whole radio on or off.
 
-**Док внизу:** пауза/продолжение (в покое — повтор последнего ответа), каналы, журнал.
+Below the circle: a hint (LONG press it to switch the send mode — on silence or only by the
+word), a "✕ cancel" button while you dictate and "🎙 interrupt and speak" while a reply plays.
 
-## Каналы
+**Dock at the bottom:** pause/resume (when idle — replay the last reply), channels, log.
 
-Кнопка «каналы» открывает список. У каждого канала:
-- **«в работу»** — кого ты слышишь. Отмечай сколько нужно: слышны ровно отмеченные, всё
-  остальное молчит, включая новые сессии. Ничего не отмечено — слышны все.
-- **«ответить»** — сказать именно этому каналу. Действует на одно сообщение, потом снова
-  работает общее правило.
-- **долгий тап по строке** — убрать канал из списка (вернётся, когда реально ответит).
-  Убранный канал перестаёт быть адресатом и не показывается в шапке после перезапуска.
-- Состояние словами: «работает · N мин» (ты спросил, ответа нет), «ответил · N мин назад»,
-  «не слушает» (приёмник сессии умер — сообщения ждут в очереди), «выключен».
-- Сверху написано, с какими каналами ты сейчас работаешь.
+## Channels
 
-Над списком три кнопки:
-- **«✎ править»** — режим галочек: видны все каналы, которые знает сервер, в том числе
-  убранные. Отметь, какие держать в списке, — вернуть или убрать можно сразу несколько.
-- **«↻ обновить»** — перечитать список с сервера.
-- **«✕ закрыть»** — закрыть шторку.
+The "channels" button opens the list. Each channel has:
+- **"active"** — whom you hear. Tick as many as you like: you hear exactly the ticked ones,
+  everything else stays silent, including new sessions. Nothing ticked — you hear everyone.
+- **"reply"** — talk to this channel specifically. Works for one message, then the usual rule
+  applies again.
+- **long press on a row** — remove the channel from the list (it comes back when it really
+  replies). A removed channel stops being the recipient and is not shown in the header after
+  a restart.
+- Status in words: "working · N min" (you asked, no reply yet), "replied · N min ago",
+  "not listening" (the session's receiver died — messages wait in the queue), "off".
+- The top line says which channels you are working with right now.
 
-**Сессия после сжатия контекста.** Claude Code при сжатии даёт сессии новый номер, и для рации
-это новый канал. Если прежний канал с тем же именем был у тебя «в работе» и молчит уже пять
-минут, рация сама переносит выбор на продолжение и говорит «канал такой-то продолжается».
+Three buttons above the list:
+- **"✎ edit"** — tick mode: you see every channel the relay knows, including removed ones.
+  Tick the ones to keep — you can bring back or remove several at once.
+- **"↻ refresh"** — re-read the list from the relay.
+- **"✕ close"** — close the panel.
 
-**Правило адресата:** ответ всегда уходит тому, кто говорил последним. Ничего закреплять
-не нужно. Исключения: свежий ручной выбор кнопкой «ответить», режим одного канала и то,
-что ты уже начал диктовать.
+**A session after context compaction.** When Claude Code compacts the context it gives the
+session a new id, and for the radio that is a new channel. If the old channel with the same
+name was active and has been silent for five minutes, the radio moves your choice to the
+continuation and says "channel such-and-such continues".
 
-## Голос
+**Recipient rule:** your answer always goes to whoever spoke last. Nothing needs pinning.
+Exceptions: a fresh manual choice with the "reply" button, single-channel mode, and whatever
+you have already started dictating.
 
-- **«отправляй»** — отправить надиктованное.
-- **«отбой»** — стереть черновик, ничего не отправлять, усыпить микрофон. Работает и
-  посреди фразы. Дополнительных слов не нужно.
-- **«отмена»** — стереть черновик.
-- **«переключи на <имя>»**, **«переключи на вторую»** — сменить адресата.
-- **«какие сессии»** — зачитать список.
-- **«открепи»** — вернуться к правилу «отвечаю последнему говорившему».
+## Voice
 
-Если сказать нечего — просто молчи: через 70 секунд без единого слова микрофон уснёт сам.
+- **"send"** — send what you dictated (it must be the last word; "send please" and
+  "send now" work too).
+- **"cancel"** — said on its own: erase the draft.
 
-## Системные фразы и ответы
+<!-- TODO before publishing: the switchboard commands ("which sessions", "switch to <name>",
+     "switch to the second", "unpin", "over and out" = erase draft + put the mic to sleep) are
+     recognised on the relay (server side) and are Russian-only today. Either add English
+     phrases to the relay or drop this list from the public guide. -->
 
-Системная фраза («ушло в такой-то», «канал не слушает») никогда не звучит поверх ответа. Если
-она приходит, пока играет ответ, ответ замирает, фраза звучит одна, и ответ продолжается с того
-же места. Подтверждение отправки называет канал, куда ушло сообщение.
+If you have nothing to say, just stay quiet: after 70 seconds without a word the microphone
+goes to sleep by itself.
 
-## Зазор между каналами
+## System phrases and replies
 
-Когда подряд отвечают два канала, после первого рация говорит «ответь такому-то, дальше
-такой-то» и даёт 12 секунд. Заговорил — очередь ждёт, пока не закончишь. Отправил —
-следующий пойдёт сразу. Промолчал — поедет дальше сам.
+A system phrase ("sent to such-and-such", "channel is not listening") never plays over a
+reply. If it arrives while a reply is playing, the reply freezes, the phrase plays alone, and
+the reply continues from the same spot. The send confirmation names the channel the message
+went to.
 
-## Настройки
+## Gap between channels
 
-Шесть строк человеческим языком: только в наушниках, называть канал перед ответом,
-голосовые подсказки, отправка по тишине. Ниже — «для продвинутых» (адрес релея, whisper,
-безрукий режим, источник записи, догон) и «отладка» (журнал).
+When two channels reply back to back, after the first one the radio says "reply to X, next,
+Y" and gives you 12 seconds. Start talking — the queue waits until you finish. Send — the next
+reply plays right away. Stay silent — it moves on by itself.
 
-Первый запуск: три шага и ссылка-настройка — скрипт установки на сервере печатает QR,
-телефон сканирует, конфиг встаёт сам.
+## Settings
 
-## Если что-то не так
+A few plain-language switches: headphones only, name the channel before a reply, voice cues,
+send on silence. Below them, "advanced" (relay address, whisper, hands-free mode, recording
+source, catch-up) and "debug" (log).
 
-- **Рация молчит после нажатия.** Через 2,5 секунды она сама скажет причину вслух
-  («надень наушники», «рация на паузе», «очередь стоит») и запишет её в журнал.
-- **«Канал не слушает».** Приёмник сессии на компьютере умер; сообщения не потеряны, они
-  ждут в очереди и дойдут, когда он оживёт.
-- **Нет связи.** Ответы копятся на сервере и придут при подключении — рация скажет
-  «есть ответы».
-- **Журнал** (кнопка внизу справа) — там видно всё: какие фразы звучали, куда ушло
-  сообщение, почему не заиграл звук.
+First start: three steps and a setup link — the install script on your server prints a QR
+code, the phone scans it, and the config sets itself up.
+
+## If something is wrong
+
+- **The radio is silent after a tap.** After 2.5 seconds it says the reason aloud ("put on
+  your headphones", "can't play") and writes it to the log.
+- **"Channel is not listening".** The session's receiver on your computer died; messages are
+  not lost, they wait in the queue and arrive when it comes back.
+- **Offline.** Replies pile up on the relay and arrive when you reconnect — the radio says
+  "replies waiting".
+- **Log** (bottom right button) — everything is there: which phrases played, where a message
+  went, why sound did not start.

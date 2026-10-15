@@ -1,6 +1,6 @@
 // Whisper transcriber for the voice bridge. Watches UTT_DIR for dictation
 // segments uploaded by the phone (via relay /utt), transcribes them with
-// whisper.cpp (base model, ru), accumulates per-utterance text, detects the
+// whisper.cpp (base model, language from WHISPER_LANG, default auto), accumulates per-utterance text, detects the
 // spoken send-word (and cancel-word) at the tail, and on finalize posts the
 // text back through relay /uttdone (which routes it into the session and
 // notifies the phone).
@@ -23,25 +23,22 @@
 //  - abandoned utts are delivered with an explicit marker;
 //  - a bad file can no longer abort the whole tick (per-file try/catch).
 //
-// Runs as pm2 process `voice-whisper`, niced so other processes on the box never starve.
-//
-// Paths: by default everything is taken from the directory this file sits in — the same
-// place install-relay.sh puts config.json and where relay.js writes utt/. Override with
-// environment variables if your layout differs:
-//   VB_DIR=/srv/claudio  WHISPER_BIN=/opt/whisper.cpp/build/bin/whisper-cli \
-//   WHISPER_MODEL=/opt/whisper.cpp/models/ggml-base.bin  pm2 start transcribe.js --name voice-whisper
+// Runs as pm2 process `voice-whisper`, niced so other services on the box never starve.
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const https = require('https');
 
-const DIR = process.env.VB_DIR || __dirname;
+const DIR = path.join(process.env.HOME, 'voice_bridge');
 const UTT_DIR = path.join(DIR, 'utt');
 const CFG = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
-const HOME = process.env.HOME || '';
-const WHISPER = process.env.WHISPER_BIN || path.join(HOME, 'whisper.cpp', 'build', 'bin', 'whisper-cli');
-const MODEL = process.env.WHISPER_MODEL || path.join(HOME, 'whisper.cpp', 'models', 'ggml-base.bin');
+const WHISPER = path.join(process.env.HOME, 'whisper.cpp', 'build', 'bin', 'whisper-cli');
+const MODEL = path.join(process.env.HOME, 'whisper.cpp', 'models', 'ggml-base.bin');
 const PORT = CFG.port || 8443;
+// Язык распознавания для whisper-cli -l: "auto" (по умолчанию), "en", "ru"… Владельцу — WHISPER_LANG=ru.
+const WHISPER_LANG = process.env.WHISPER_LANG || 'auto';
+// English commands only off a pure-Russian setup: there the old Russian rules stay exactly as they were.
+const EN_CMDS = WHISPER_LANG !== 'ru';
 
 const log = (m) => process.stdout.write(`[${new Date().toISOString()}] ${m}\n`);
 
@@ -50,12 +47,14 @@ const log = (m) => process.stdout.write(`[${new Date().toISOString()}] ${m}\n`);
 const state = new Map();
 
 // Finished/cancelled utt ids (ring of 200) with enough context to re-home
-// stragglers: utt -> { session, at, cancelled, appV }
+// stragglers: utt -> { session, at, cancelled, appV, seqs }
 const done = new Map();
 const doneOrder = [];
 function markDone(utt, st, cancelled) {
   if (done.has(utt)) return;
-  done.set(utt, { session: st ? st.session : '', at: Date.now(), cancelled: !!cancelled, appV: st ? st.appV : 0 });
+  // seqs (v1.42): уже прочитанные сегменты — их повтор (ретрай телефона) не станет новым сообщением
+  done.set(utt, { session: st ? st.session : '', at: Date.now(), cancelled: !!cancelled, appV: st ? st.appV : 0,
+    seqs: st ? new Set(st.doneSeqs) : new Set() });
   doneOrder.push(utt);
   while (doneOrder.length > 200) done.delete(doneOrder.shift());
 }
@@ -63,6 +62,14 @@ function markDone(utt, st, cancelled) {
 // Same fuzzy send-word rule as the app. NOTE: \w is ASCII-only in JS (the
 // Kotlin original relied on ICU \w) — the class must be explicit.
 const SEND_RE = /^([оа]т?|т)п+рав[а-яёa-z0-9]*$/;
+// v1.42 (боевое 15.10: два финала посреди живой речи за две минуты, телефон выбросил хвосты).
+// Корень шаблона шире команды: «отправил», «отправлю», «отправлено», «отправка», «оправдан»
+// — это рассказ, не приказ, и посреди диктовки о делах они звучат постоянно. Сужение, не
+// расширение (закон: ложный финал дороже пропуска): повелительные и неопределённые формы
+// и уличные искажения «отправляй» по-прежнему ловятся. «Отправляю/отправляем» оставлены:
+// whisper слышит так и саму команду, данных, что они режут речь, нет.
+const NOT_SEND_RE = /^([оа]т?|т)п+рав(ил|лял|лен|лён|лю$|ит$|итс|ят|ител|лени|им$|ишь|ляешь|к|д)/;
+const isSendWord = (w) => SEND_RE.test(w) && !NOT_SEND_RE.test(w);
 // v0.50 (боевое: юзер трижды сказал «отправляй», не сработало ни разу): whisper на улице
 // отрывает приставку в отдельное слово — в логах «от правилей», «от правляй». Ловим и такой
 // вид, но УЗКО: только корень «правля*» (правляй/правляйте). «правил», «правда», «правильно»
@@ -73,19 +80,74 @@ const CANCEL_RE = /^отмен[а-яёa-z0-9]*$/;   // «отмена/отмен
 const FILLERS = new Set(['пожалуйста', 'сейчас', 'давай', 'сообщение', 'это', 'уже', 'быстро']);
 const norm = (w) => w.toLowerCase().replace(/[^а-яёa-z0-9]/g, '');
 
+// English send/cancel are deliberately strict (a send mid-speech is worse than a miss):
+// the LAST SENTENCE of the text must be exactly one of these phrases, nothing else.
+// "I'll send", "don't send", "please send" never fire.
+const EN_SEND = new Set(['send', 'send it', 'send please', 'send now']);
+const EN_CANCEL = new Set(['cancel']);
+const enNorm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+function lastSentence(text) {
+  const m = text.match(/([^.!?]*)[.!?\s]*$/);
+  return { phrase: enNorm(m[1]), at: m.index, raw: m[1].trim() };
+}
+
 function stripSendWord(text) {
+  if (EN_CMDS) {
+    const ls = lastSentence(text);
+    if (EN_SEND.has(ls.phrase)) return { text: text.slice(0, ls.at).trim(), hit: true, word: ls.raw };
+  }
   const words = text.trim().split(/\s+/);
   if (!words.length) return { text, hit: false };
   let cut = -1;
   const li = words.length - 1;
-  if (SEND_RE.test(norm(words[li]))) cut = li;
-  else if (words.length >= 2 && FILLERS.has(norm(words[li])) && SEND_RE.test(norm(words[li - 1]))) cut = li - 1;
+  if (isSendWord(norm(words[li]))) cut = li;
+  else if (words.length >= 2 && FILLERS.has(norm(words[li])) && isSendWord(norm(words[li - 1]))) cut = li - 1;
   // v0.51 ОТКАТ: разорванное «от|правляй» временно ОТКЛЮЧЕНО. В поле сразу же случилось
   // ложное срабатывание (финал по стоп-слову посреди живой речи) — а это боль №1 проекта,
   // она дороже пропуска. Возвращаемся к проверенному правилу; ниже пишем в лог, ЧТО именно
   // было принято за команду, чтобы решать по факту, а не по догадке.
   if (cut < 0) return { text, hit: false };
   return { text: words.slice(0, cut).join(' ').trim(), hit: true, word: words.slice(cut).join(' ') };
+}
+
+// v1.42 (боевое 15.10, лог whisper: utt mv9scob0 seg 4 — 20.0с звука, текст кончается
+// «…Отправляе», финал по стоп-слову). Телефон режет сегмент по длине (20с) посреди слова;
+// обрубок «отправляешь/отправляем» подходит под SEND_RE, а продолжение слова и речь за ним
+// уехали следующим сегментом в уже закрытое сообщение. Телефон (1.42+) метит такой сегмент
+// (cut: len — по 20с, probe — 4с-проба после него). Стоп-слово в хвосте помеченного сегмента
+// не финализирует сразу: решает следующий сегмент. Слова в нём = речь шла дальше, не команда
+// (текст склеен как есть). Пусто (whisper слов не нашёл) или ничего не пришло за срок = команда.
+// Срок после probe длиннее: следующий кусок телефон пришлёт только на паузе или через 20с.
+// Старый телефон метки не шлёт — ведёт себя как раньше.
+const SEND_WAIT_LEN = 12000;   // проба 4с + отгрузка по мобильной сети + очередь whisper
+const SEND_WAIT_PROBE = 25000;
+// pend — отложенное стоп-слово {seq, word, deadline} или null; text — весь текст utt с этим
+// сегментом; segText — текст этого сегмента; cut — метка сегмента ('', 'len', 'probe').
+// Возврат: { pend, word, note } — word не пуст = финализировать по стоп-слову сейчас.
+function sendDecision(pend, text, segText, cut, seq, now) {
+  let note = '';
+  // ревью: решает только ПОСЛЕДУЮЩИЙ сегмент; запоздавший предыдущий ничего не меняет
+  if (pend && seq < pend.seq) return { pend, word: '', note };
+  // ревью: сегмент без слов не может сделать командой то, что ею уже не было
+  // (иначе отвергнутый обрубок + «сейчас» воскресал бы на следующем пустом куске)
+  if (!pend && !segText) return { pend: null, word: '', note };
+  let rejected = false;
+  if (pend) {
+    if (!segText) return { pend: null, word: pend.word, note: `за отложенным "${pend.word}" слов нет — это команда` };
+    note = `после "${pend.word}" речь продолжилась — не команда, склеено`;
+    rejected = true;
+    // ревью: прежний обрубок отвергнут — команду ищем только в новом сегменте, иначе
+    // продолжение «пожалуйста»/«сейчас» (FILLERS) снова сделало бы обрубок стоп-словом
+    text = segText;
+  }
+  const { hit, word } = stripSendWord(text);
+  if (!hit) return { pend: null, word: '', note, rejected };
+  if (cut) {
+    const wait = cut === 'probe' ? SEND_WAIT_PROBE : SEND_WAIT_LEN;
+    return { pend: { seq, word, deadline: now + wait }, rejected,
+      word: '', note: (note ? note + '; ' : '') + `стоп-слово "${word}" в хвосте обрезанного (${cut}) сегмента — жду следующий до ${wait / 1000}с` };
+  }
+  return { pend: null, word, note, rejected };
 }
 
 // v0.54 (слово юзера 30.07: «рубка между сессиями нужна, но по НАЗВАНИЯМ работать не будет —
@@ -184,6 +246,7 @@ function parseCmd(text) {
 }
 
 function tailCancel(text) {
+  if (EN_CMDS && EN_CANCEL.has(lastSentence(text).phrase)) return true;
   const words = text.trim().split(/\s+/).filter(Boolean);
   if (!words.length) return false;
   return CANCEL_RE.test(norm(words[words.length - 1]));
@@ -242,7 +305,7 @@ function newState(utt) {
 
 function transcribe(wav) {
   try {
-    const out = execFileSync('nice', ['-n', '10', WHISPER, '-m', MODEL, '-f', wav, '-l', 'ru', '-nt', '-t', '3'],
+    const out = execFileSync('nice', ['-n', '10', WHISPER, '-m', MODEL, '-f', wav, '-l', WHISPER_LANG, '-nt', '-t', '3'],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 120000 });
     return out.replace(/\s+/g, ' ').trim();
   } catch (e) {
@@ -259,8 +322,11 @@ async function finalize(utt, st, why) {
   let text = why === 'cancelled' ? '' : st.text.trim();
   if (text) {
     const r = stripSendWord(text);
-    if (r.hit) log(`utt ${utt}: срезано стоп-слово "${r.word}"`);
-    text = r.text;
+    // v1.42: отвергнутый обрубок («Отправляе» + «сейчас») — часть речи, не срезать
+    if (r.hit && r.text.length >= (st.keepLen || 0)) {
+      log(`utt ${utt}: срезано стоп-слово "${r.word}"`);
+      text = r.text;
+    }
   }
   if (why === 'abandoned' && text) text = '(обрывок диктовки, доехал с опозданием) ' + text;
   // v0.54: команда рации перехватывается ЗДЕСЬ и в сессию не уходит. Гейт по версии клиента
@@ -275,8 +341,11 @@ async function finalize(utt, st, why) {
     }
   }
   log(`utt ${utt} FINAL (${why}): "${text.slice(0, 80)}"`);
+  // v1.42: причина финала едет в телефон — в журнале видно, ПОЧЕМУ сервер закрыл сообщение
   const code = await relayPost('/uttdone', {
     utt, session_id: st.session, text, empty: !text && !cmd, cancelled: why === 'cancelled', cmd,
+    why: why === 'final' && st.sendWord ? 'send-word' : why, word: st.sendWord || '',
+    orphan: !!st.orphan,   // v1.42: хвост после чужого финала — телефон не скажет второе «ушло»
   });
   if (code !== 200) {
     // Relay down/restarting: keep the text, retry on the next tick — a restart
@@ -289,13 +358,24 @@ async function finalize(utt, st, why) {
   st.finishedAt = Date.now();
   st.finalReady = false;
   markDone(utt, st, why === 'cancelled');
-  cleanup(utt);
+  cleanup(utt, why === 'cancelled' ? null : st.doneSeqs);
 }
 
-function cleanup(utt) {
+// v1.42 (боевое 15.10, ревью): финал посреди речи (стоп-слово, тишина, «отбой») стирал и
+// сегменты, которые уже лежали на диске, но ещё не прочитаны, — это речь ПОСЛЕ финала.
+// С keep (набор прочитанных seq) непрочитанные сегменты (и финальный со звуком) остаются: done-ring
+// следующим проходом переселит их в `${utt}r` (rehomeStraggler), а не удалит.
+const cutMark = (utt, seq) => path.join(UTT_DIR, `${utt}_${String(seq).padStart(3, '0')}.cut`);
+
+function cleanup(utt, keep) {
   try {
-    for (const f of fs.readdirSync(UTT_DIR))
-      if (f.startsWith(utt)) fs.unlinkSync(path.join(UTT_DIR, f));
+    for (const f of fs.readdirSync(UTT_DIR)) {
+      if (!f.startsWith(utt)) continue;
+      // v1.42: метка .cut непрочитанного сегмента остаётся вместе с ним (переедет в rehome)
+      const m = keep && f.match(/^([a-z0-9]+)_(\d{3})(_F)?\.(wav|cut)$/);
+      if (m && m[1] === utt && !keep.has(parseInt(m[2], 10))) continue;
+      fs.unlinkSync(path.join(UTT_DIR, f));
+    }
   } catch (_) {}
   state.delete(utt);
 }
@@ -305,15 +385,23 @@ function cleanup(utt) {
 // utterance instead; the short orphan flush delivers it within ~30s.
 function rehomeStraggler(utt, f, seq, info) {
   const rid = `${utt}r`;
-  if (done.has(rid)) { try { fs.unlinkSync(path.join(UTT_DIR, f)); } catch (_) {} return; }
+  if (done.has(rid)) {
+    try { fs.unlinkSync(path.join(UTT_DIR, f)); } catch (_) {}
+    try { fs.unlinkSync(cutMark(utt, seq)); } catch (_) {}
+    return;
+  }
   try {
     fs.writeFileSync(path.join(UTT_DIR, `${rid}.meta.json`),
       JSON.stringify({ session: info.session, ts: Date.now(), v: info.appV, orphan: true }));
+    // v1.42 (ревью): метка «обрезан посреди речи» едет вместе с сегментом — хвост не теряет защиту
+    try { fs.renameSync(cutMark(utt, seq), cutMark(rid, seq)); } catch (_) {}
     fs.renameSync(path.join(UTT_DIR, f), path.join(UTT_DIR, `${rid}_${String(seq).padStart(3, '0')}.wav`));
     log(`utt ${utt} seg ${seq}: arrived after finalize — re-homed to ${rid}`);
   } catch (e) {
     log(`rehome err ${f}: ${e.message}`);
     try { fs.unlinkSync(path.join(UTT_DIR, f)); } catch (_) {}
+    try { fs.unlinkSync(cutMark(utt, seq)); } catch (_) {}
+    try { fs.unlinkSync(cutMark(`${utt}r`, seq)); } catch (_) {}
   }
 }
 
@@ -352,8 +440,11 @@ async function tick() {
           const fresh = Date.now() - doneInfo.at < 60000;
           let size = 0;
           try { size = fs.statSync(full).size; } catch (_) {}
-          if (!fin && fresh && !doneInfo.cancelled && size > 100) rehomeStraggler(utt, f, seq, doneInfo);
-          else { try { fs.unlinkSync(full); } catch (_) {} }
+          // v1.42 (ревью): финальный сегмент со звуком — тоже речь (телефон отправил хвост в
+          // закрытый сервером utt, не успев узнать о финале); повтор прочитанного seq — не речь
+          const seen = doneInfo.seqs && doneInfo.seqs.has(seq);
+          if (fresh && !doneInfo.cancelled && size > 100 && !seen) rehomeStraggler(utt, f, seq, doneInfo);
+          else { try { fs.unlinkSync(full); } catch (_) {} try { fs.unlinkSync(cutMark(utt, seq)); } catch (_) {} }
           continue;
         }
         const st = state.get(utt) || newState(utt);
@@ -362,10 +453,16 @@ async function tick() {
         // utterance — leave them on disk, they'll be re-homed after finalize
         if (st.finalSeen && seq > st.finalSeq) continue;
         st.doneSeqs.add(seq);
+        // v1.42: метка «обрезан посреди речи» — релей пишет её ДО wav; читаем только сегмент,
+        // который сейчас разбираем (непрочитанный уедет с меткой в rehome)
+        let cut = '';
+        try { cut = fs.readFileSync(cutMark(utt, seq), 'utf8').trim(); fs.unlinkSync(cutMark(utt, seq)); } catch (_) {}
+        if (fin) cut = '';
         const size = fs.statSync(full).size;
+        let text = '';
         if (size > 100) {
           const t0 = Date.now();
-          const text = stripNoise(transcribe(full));
+          text = stripNoise(transcribe(full));
           if (text) { st.text = (st.text + ' ' + text).trim(); st.emptyMs = 0; st.warned = false; }
           else st.emptyMs += (size / 32000) * 1000;   // сек звука без слов -> мс
           log(`utt ${utt} seg ${seq}: ${(size / 32000).toFixed(1)}s audio -> ${Date.now() - t0}ms, "${text.slice(0, 60)}"`);
@@ -377,6 +474,14 @@ async function tick() {
           st.finalSeen = true;
           st.finalSeq = seq;
           st.finalDeadline = Date.now() + 15000;
+          // v1.42: финал разрешает отложенное стоп-слово: слова в нём — речь шла дальше
+          if (st.sendPend) {
+            if (text) {
+              log(`utt ${utt}: после "${st.sendPend.word}" речь продолжилась — не команда`);
+              st.keepLen = st.text.length - text.length - 1;
+            } else st.sendWord = st.sendPend.word;
+            st.sendPend = null;
+          }
           continue;
         }
         // voice cancel arrived mid-stream (v36+ apps only: older apps can't
@@ -394,9 +499,16 @@ async function tick() {
           }
         }
         // send-word arrived mid-stream: finalize as soon as every seq is here
-        const { hit, word } = stripSendWord(st.text);
-        if (hit) {
+        // v1.42: на сегменте, обрезанном посреди речи, — только после следующего (sendDecision)
+        const sd = sendDecision(st.sendPend, st.text, text, cut, seq, Date.now());
+        st.sendPend = sd.pend;
+        // текст до отвергнутого обрубка включительно finalize не срезает как стоп-слово
+        if (sd.rejected) st.keepLen = st.text.length - text.length - 1;
+        if (sd.note) log(`utt ${utt}: ${sd.note}`);
+        if (sd.word) {
+          const word = sd.word;
           log(`utt ${utt}: стоп-слово распознано как "${word}" — финализирую`);
+          st.sendWord = word;
           let gap = false;
           for (let i = 0; i < seq; i++) if (!st.doneSeqs.has(i)) { gap = true; break; }
           if (!gap) await finalize(utt, st, 'send-word');
@@ -424,6 +536,14 @@ async function tick() {
       } catch (e) {
         log(`file err ${f}: ${e.message}`);
       }
+    }
+    // v1.42: отложенное стоп-слово, за которым за срок ничего не пришло, — команда
+    for (const [utt, st] of state) {
+      if (st.finishedAt || st.finalSeen || !st.sendPend || Date.now() <= st.sendPend.deadline) continue;
+      log(`utt ${utt}: за "${st.sendPend.word}" сегментов нет — это команда, финализирую`);
+      st.sendWord = st.sendPend.word;
+      st.finalSeen = true; st.finalSeq = st.sendPend.seq; st.finalDeadline = Date.now() + 15000;
+      st.sendPend = null;
     }
     // finals: ship once every seq up to finalSeq has been seen (or the wait expires)
     for (const [utt, st] of state) {
@@ -455,16 +575,6 @@ async function tick() {
 
 function lastTouch(utt) {
   try { return fs.statSync(path.join(UTT_DIR, `${utt}.meta.json`)).mtimeMs; } catch (_) { return 0; }
-}
-
-// Fail loudly at startup instead of silently transcribing nothing: a missing binary or
-// model only shows up later as "the radio never returns any text", which is hard to trace.
-for (const [what, p] of [['whisper binary', WHISPER], ['whisper model', MODEL]]) {
-  if (!fs.existsSync(p)) {
-    log(`FATAL: ${what} not found at ${p}`);
-    log('build whisper.cpp and download a model, or point WHISPER_BIN / WHISPER_MODEL at them');
-    process.exit(1);
-  }
 }
 
 log(`voice-whisper up: watching ${UTT_DIR}, model ${path.basename(MODEL)}`);

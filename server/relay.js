@@ -12,24 +12,12 @@ const CFG = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
 const AUDIO_DIR = path.join(DIR, 'audio');
 const UTT_DIR = path.join(DIR, 'utt');   // raw dictation segments awaiting whisper
 const LOG = path.join(DIR, 'relay.log');
-// 0700: these hold recorded speech and synthesized answers — not for other users of the box
-if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true, mode: 0o700 });
-if (!fs.existsSync(UTT_DIR)) fs.mkdirSync(UTT_DIR, { recursive: true, mode: 0o700 });
+if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
+if (!fs.existsSync(UTT_DIR)) fs.mkdirSync(UTT_DIR, { recursive: true });
 
-// The log used to keep the first 60 characters of every message, forever and unrotated —
-// that is a transcript of your conversations sitting on the server. Default is now the
-// length only; set "logText": true in config.json when you are actually debugging.
-const LOG_TEXT = CFG.logText === true;
-const peek = (t) => (LOG_TEXT ? String(t).slice(0, 60) : `${String(t).length} chars`);
-
-// Keep the log bounded: rotate at 5 MB, keep one previous file.
-const LOG_MAX = 5 * 1024 * 1024;
 function log(m) {
   const line = `[${new Date().toISOString()}] ${m}\n`;
-  try {
-    if (fs.existsSync(LOG) && fs.statSync(LOG).size > LOG_MAX) fs.renameSync(LOG, `${LOG}.1`);
-    fs.appendFileSync(LOG, line);
-  } catch (_) {}
+  try { fs.appendFileSync(LOG, line); } catch (_) {}
   process.stdout.write(line);
 }
 
@@ -148,7 +136,7 @@ function handler(req, res) {
         const subs = sessions.get(sid);
         let n = 0;
         if (subs) for (const ws of subs) if (ws.readyState === 1) { ws.send(`[ГОЛОС С ТЕЛЕФОНА] ${text}`); n++; }
-        log(`say -> ${sid.slice(0, 8)}: ws ${n}, queued ${q.length}, ${peek(text)}`);
+        log(`say -> ${sid.slice(0, 8)}: ws ${n}, queued ${q.length}, ${text.slice(0, 60)}`);
         send(200, { ok: true, ws: n, queued: q.length, unread: !readerFresh(sid) });
       });
       return;
@@ -173,9 +161,14 @@ function handler(req, res) {
           fs.writeFileSync(path.join(UTT_DIR, `${utt}.meta.json`),
             JSON.stringify({ session: sid, ts: Date.now(), v: parseInt(url.searchParams.get('v') || '0', 10), nosil: url.searchParams.get('nosil') === '1' }));
           const name = `${utt}_${String(seq).padStart(3, '0')}${fin ? '_F' : ''}.wav`;
+          // v1.42: сегмент обрезан посреди речи (len — по 20с, probe — проба после такой обрезки).
+          // Метку пишем ДО wav: whisper подбирает wav сразу и должен уже видеть метку.
+          const cut = url.searchParams.get('cut') || '';
+          if (!fin && buf.length && (cut === 'len' || cut === 'probe'))
+            fs.writeFileSync(path.join(UTT_DIR, `${utt}_${String(seq).padStart(3, '0')}.cut`), cut);
           if (buf.length) fs.writeFileSync(path.join(UTT_DIR, name), buf);
           else if (fin) fs.writeFileSync(path.join(UTT_DIR, name), Buffer.alloc(0));
-          log(`utt ${utt} seg ${seq}${fin ? ' FINAL' : ''}: ${buf.length}b`);
+          log(`utt ${utt} seg ${seq}${fin ? ' FINAL' : ''}${cut && !fin ? ' cut=' + cut : ''}: ${buf.length}b`);
           send(200, { ok: true });
         } catch (e) { send(500, { error: String(e) }); }
       });
@@ -204,7 +197,7 @@ function handler(req, res) {
           const subs = sessions.get(sid);
           let n = 0;
           if (subs) for (const ws of subs) if (ws.readyState === 1) { ws.send(`[ГОЛОС С ТЕЛЕФОНА] ${text}`); n++; }
-          log(`uttdone -> ${sid.slice(0, 8)}: ws ${n}, queued ${queued}, ${peek(text)}`);
+          log(`uttdone -> ${sid.slice(0, 8)}: ws ${n}, queued ${queued}, ${text.slice(0, 60)}`);
         }
         // v0.36: honest event types. utt_lost = text existed but was NOT routed anywhere
         // (no session id, or the inbox map is full) — the phone used to hear a confident
@@ -217,6 +210,9 @@ function handler(req, res) {
         if (cmd) log(`uttdone CMD -> phone: ${JSON.stringify(cmd)}`);
         broadcastPhones({
           type, utt: body.utt || '', cmd,
+          // v1.42: причина серверного финала и принятое за стоп-слово — для журнала телефона
+          why: String(body.why || '').slice(0, 20), word: String(body.word || '').slice(0, 40),
+          orphan: !!body.orphan,
           session: sid, text: text.slice(0, 1000), ts: Date.now(),
           // v0.37: «ушло» в очередь, которую никто не читает — телефон предупредит юзера
           unread: type === 'utt_sent' && !readerFresh(sid),

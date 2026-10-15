@@ -15,7 +15,7 @@ import android.os.Bundle
 class VoiceCmdActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        LogBus.add("кнопка (канал ассистента): пришёл ${intent?.action}")
+        LogBus.add(tr("кнопка (канал ассистента): пришёл ${intent?.action}", "button (assistant channel): got ${intent?.action}"))
         BridgeService.instance?.onButton()
         finish()
     }

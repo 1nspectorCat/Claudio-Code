@@ -46,6 +46,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicInteger
 import java.io.File
 import java.io.IOException
 import java.util.ArrayDeque
@@ -74,8 +75,10 @@ class BridgeService : Service() {
         // v0.36: версия из BuildConfig — единый источник с gradle (versionName), конец рассинхрона
         val APP_VERSION: String = BuildConfig.VERSION_NAME
         const val CH = "bridge"
-        val SEND_WORDS = listOf("отправляй", "отправляйте")
-        val CANCEL_WORDS = listOf("отмена", "отменить")
+        val SEND_WORDS = if (Lang.en) listOf("send") else listOf("отправляй", "отправляйте")
+        val CANCEL_WORDS = if (Lang.en) listOf("cancel") else listOf("отмена", "отменить")
+        // store: отправка только когда ВЕСЬ сегмент — одна из этих фраз («I'll send» не шлёт).
+        val EN_SEND_PHRASES = setOf("send", "send it", "send please", "send now")
 
         // v0.46: три НЕЗАВИСИМЫХ ограничителя вместо одного. Даже если откажут два первых,
         // сообщение всё равно уйдёт — это единственная безусловная страховка от обратной беды
@@ -292,6 +295,9 @@ class BridgeService : Service() {
     @Volatile private var ttsSpeaking = false
     @Volatile private var lastTtsEndTs = 0L
     @Volatile private var announceProceed: Runnable? = null
+    @Volatile private var announceId: String? = null
+    private val pendingSynth = AtomicInteger(0)
+    private val announceSeq = AtomicInteger(0)
     @Volatile private var userActionTs = 0L   // v0.37: последнее осознанное действие юзера
     private var lastUnreadCueTs = 0L          // v0.37: не пилить «сессия не слушает» чаще раза в минуту
     private var lastEmptyCueTs = 0L           // v0.37: и «ничего не расслышал» тоже
@@ -318,7 +324,7 @@ class BridgeService : Service() {
                 // гейтом playFile в очередь, а не в мусор. Снимет кнопка/наушники/сторож 90с.
                 AudioManager.AUDIOFOCUS_LOSS -> {
                     if (!playing && !paused) return@post
-                    LogBus.add("звук забрало другое приложение — пауза (кнопка продолжит, сам — через 90с)")
+                    LogBus.add(tr("звук забрало другое приложение — пауза (кнопка продолжит, сам — через 90с)", "audio taken by another app — paused (button resumes, auto-resume in 90s)"))
                     val pos = if (paused) pausedAtMs else if (cueHold) cueHoldAtMs else (try { player?.currentPosition ?: 0 } catch (_: Exception) { 0 })
                     cueHold = false
                     try { player?.stop() } catch (_: Exception) {}
@@ -333,7 +339,7 @@ class BridgeService : Service() {
                     updateNotification()
                 }
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                    if (playing) LogBus.add("аудиофокус отобран на время (звонок?) — жду")
+                    if (playing) LogBus.add(tr("аудиофокус отобран на время (звонок?) — жду", "audio focus taken temporarily (call?) — waiting"))
                     try { player?.let { if (it.isPlaying) it.pause() } } catch (_: Exception) {}
                 }
                 AudioManager.AUDIOFOCUS_GAIN ->
@@ -360,18 +366,18 @@ class BridgeService : Service() {
                 if (!alive || !headsetPresent()) return@post
                 // v0.36: наушники вернулись — снимаем «паузу потери наушников» сами
                 if (paused && !playing) {
-                    LogBus.add("наушники вернулись — продолжаю с места паузы")
+                    LogBus.add(tr("наушники вернулись — продолжаю с места паузы", "headphones back — resuming from the pause point"))
                     resumeIfPaused()
                     return@post
                 }
                 if (!playing && (playQueue.isNotEmpty() || fileQueue.isNotEmpty())) {
-                    LogBus.add("наушники подключены — продолжаю")
+                    LogBus.add(tr("наушники подключены — продолжаю", "headphones connected — resuming"))
                     kickPlayback()
                 }
                 // v0.36: гарнитура вернулась посреди диктовки — вернуть ей микрофон
                 // (setCommunicationDevice перекидывает живой VOICE_COMMUNICATION-поток)
                 if (listening && Cfg.btMic && !scoStarted) {
-                    LogBus.add("гарнитура вернулась — микрофон снова её")
+                    LogBus.add(tr("гарнитура вернулась — микрофон снова её", "headset back — microphone is on it again"))
                     startHeadsetMic()
                 }
             }
@@ -401,7 +407,7 @@ class BridgeService : Service() {
         if (!Cfg.btMic) {
             Cfg.btMic = true
             Cfg.save(this)
-            LogBus.add("микрофон принудительно переключён на гарнитуру")
+            LogBus.add(tr("микрофон принудительно переключён на гарнитуру", "microphone forced onto the headset"))
         }
         SessionBook.load(this)
         client = Net.client(Cfg.pin)
@@ -430,7 +436,7 @@ class BridgeService : Service() {
                 val l = AudioManager.OnCommunicationDeviceChangedListener { dev ->
                     val t = dev?.type ?: -1
                     if (listening && scoStarted && t != AudioDeviceInfo.TYPE_BLUETOOTH_SCO && t != 26) {
-                        LogBus.add("маршрут микрофона сменился САМ (тип $t) — если это было нажатие, гарнитура/HFP рвёт SCO")
+                        LogBus.add(tr("маршрут микрофона сменился САМ (тип $t) — если это было нажатие, гарнитура/HFP рвёт SCO", "microphone route changed ON ITS OWN (type $t) — if this was a press, the headset/HFP is dropping SCO"))
                         // v0.64 — ЗАМЕР 14.08 ДАЛ КАНАЛ ТАМ, ГДЕ ЕГО НЕ ИСКАЛИ. Скрин журнала
                         // 19:28:31: нажатие во время диктовки не приходит НИКАКИМ событием, но
                         // системный слой в этот момент рвёт SCO, и маршрут микрофона уезжает на
@@ -444,7 +450,7 @@ class BridgeService : Service() {
                         // на месте — если она пропала, это отвал наушников, а не нажатие.
                         if (Cfg.routeAsButton && headsetPresent() && !routeBtnFired) {
                             routeBtnFired = true
-                            LogBus.add("считаю это нажатием кнопки — отправляю")
+                            LogBus.add(tr("считаю это нажатием кнопки — отправляю", "treating this as a button press — sending"))
                             sendNow()
                         }
                     }
@@ -463,6 +469,7 @@ class BridgeService : Service() {
         lastProj = prefs.getString("lastProj", null)
         setupMediaSession()
         setupTts()
+        if (Cfg.voiceOff) main.postDelayed({ if (alive && Cfg.voiceOff) startSilentKeepalive() }, 1500)   // v1.28: кнопка гарнитуры в тихом режиме
         // v0.32 (исследование: в SCO-режиме гарнитуры шлют кнопку HFP AT-командой — CKPD/PTT, —
         // и до медиасессии она не доходит В ПРИНЦИПЕ; так её ловят PTT-рации): второй канал.
         try {
@@ -472,7 +479,7 @@ class BridgeService : Service() {
             )
             if (Build.VERSION.SDK_INT >= 33) registerReceiver(vendorBtnReceiver, f, RECEIVER_EXPORTED)
             else registerReceiver(vendorBtnReceiver, f)
-        } catch (e: Exception) { LogBus.add("hfp-канал кнопки: ${e.message}") }
+        } catch (e: Exception) { LogBus.add(tr("hfp-канал кнопки: ${e.message}", "hfp button channel: ${e.message}")) }
     }
 
     // Кнопка гарнитуры, пришедшая телефонным (HFP) путём во время диктовки.
@@ -488,7 +495,7 @@ class BridgeService : Service() {
             } catch (_: Exception) { "" }
             main.post {
                 if (!alive) return@post
-                LogBus.add("кнопка (HFP-канал): $cmd $args")
+                LogBus.add(tr("кнопка (HFP-канал): $cmd $args", "button (HFP channel): $cmd $args"))
                 if (cmd.contains("CKPD", true) || cmd.contains("PTT", true)) {
                     val now = System.currentTimeMillis()
                     if (now - lastBtnTs < 150) return@post
@@ -512,8 +519,8 @@ class BridgeService : Service() {
         // v0.36: строка и сторож — один раз, а не на каждый интент (каждый повторный
         // onStartCommand добавлял ПАРАЛЛЕЛЬНУЮ вечную цепочку micSleepCheck)
         if (firstStart) {
-            LogBus.add("сервис запущен (Claudio Code $APP_VERSION), подключаюсь к ${Cfg.url}")
-            LogBus.add("медиасессия активна=${mediaSession?.isActive == true} — кнопки должны идти сюда")
+            LogBus.add(tr("сервис запущен (Claudio Code $APP_VERSION), подключаюсь к ${Cfg.url}", "service started (Claudio Code $APP_VERSION), connecting to ${Cfg.url}"))
+            LogBus.add(tr("медиасессия активна=${mediaSession?.isActive == true} — кнопки должны идти сюда", "media session active=${mediaSession?.isActive == true} — buttons should arrive here"))
         }
         main.removeCallbacks(micSleepCheck)
         main.postDelayed(micSleepCheck, 30000)   // v0.8: сторож сна микрофона
@@ -554,7 +561,7 @@ class BridgeService : Service() {
         try { unregisterReceiver(vendorBtnReceiver) } catch (_: Exception) {}
         try { tones.release() } catch (_: Exception) {}   // v0.36: тёк нативный AudioTrack на каждый цикл сервиса
         wakeLock?.let { if (it.isHeld) it.release() }
-        LogBus.add("сервис остановлен")
+        LogBus.add(tr("сервис остановлен", "service stopped"))
         super.onDestroy()
     }
 
@@ -592,14 +599,14 @@ class BridgeService : Service() {
     private val cueFiles = java.util.concurrent.ConcurrentHashMap<String, File>()
     private var cuePlayer: MediaPlayer? = null
     private val CUE_PHRASES = listOf(
-        "рация на связи", "связь потеряна", "слушаю", "ушло", "отменено", "стоп", "пауза",
-        "микрофон выключен", "ничего не расслышал", "гарнитура не отвечает", "есть ответы",
-        "не знаю, кому отправить", "распознавание молчит", "канал не слушает",
-        "не ушло, отправлю при связи", "адресат сброшен, повтори",
+        tr("рация на связи", "radio online"), tr("связь потеряна", "connection lost"), tr("слушаю", "listening"), tr("ушло", "sent"), tr("отменено", "cancelled"), tr("стоп", "stop"), tr("пауза", "paused"),
+        tr("микрофон выключен", "microphone off"), tr("ничего не расслышал", "didn't catch anything"), tr("гарнитура не отвечает", "headset not responding"), tr("есть ответы", "replies waiting"),
+        tr("не знаю, кому отправить", "no one to send to"), tr("распознавание молчит", "recognition is silent"), tr("канал не слушает", "channel is not listening"),
+        tr("не ушло, отправлю при связи", "not sent, will send when back online"), tr("адресат сброшен, повтори", "recipient reset, say it again"),
         // v0.94: фразы, появившиеся в v0.73-0.93, тоже должны звучать ГРОМКО с первого раза
-        "есть ответы — нажми слушать", "отбой", "отбой, стёрто", "надень наушники",
-        "не могу играть", "отправляю начатое, потом переключусь", "сначала отправь начатое",
-        "слушаю все каналы"
+        tr("есть ответы — нажми слушать", "replies waiting — press listen"), tr("отбой", "discarded"), tr("отбой, стёрто", "discarded, erased"), tr("надень наушники", "put on your headphones"),
+        tr("не могу играть", "can't play"), tr("отправляю начатое, потом переключусь", "sending what you started, then switching"), tr("сначала отправь начатое", "send what you started first"),
+        tr("слушаю все каналы", "listening to all channels")
     )
 
     private fun prewarmCues() {
@@ -610,13 +617,14 @@ class BridgeService : Service() {
                 val f = File(cacheDir, "cue_" + Math.abs(p.hashCode()) + ".wav")
                 cueFiles[p] = f
                 if (!f.exists() || f.length() < 200) {
+                    pendingSynth.incrementAndGet()
                     t.synthesizeToFile(p, Bundle(), f, "cuefile_$p")
                 }
             }
             // v0.51: имя текущего адресата — сразу после рестарта. Через main: listenCuePhrase
             // читает SessionBook, а он не потокобезопасен и живёт на главном потоке.
             main.post { if (alive) ensureTargetCues() }
-        } catch (e: Exception) { LogBus.add("prewarm реплик: ${e.message?.take(40)}") }
+        } catch (e: Exception) { LogBus.add(tr("prewarm реплик: ${e.message?.take(40)}", "cue prewarm: ${e.message?.take(40)}")) }
     }
 
     // v0.46: единый эхо-гейт для ДАТЧИКА РЕЧИ (не путать с гейтом рекордера в whisperLoop).
@@ -632,19 +640,25 @@ class BridgeService : Service() {
     // другую, юзер этого не видел и не слышал — на ходу экран не смотрят): имя адресата
     // должно ЗВУЧАТЬ. Реплика с именем проекта готовится заранее — как только адресат сменился,
     // то есть за секунды до подъёма микрофона; к моменту «слушаю» файл уже лежит в кэше.
-    private fun ensureCue(phrase: String) {
-        val t = tts ?: return
-        if (!ttsReady || phrase.isEmpty()) return
+    // Возвращает false, только если синтез был нужен, но движок его не принял.
+    private fun ensureCue(phrase: String): Boolean {
+        val t = tts ?: return false
+        if (!ttsReady || phrase.isEmpty()) return false
         val f = cueFiles[phrase]
-        if (f != null && f.exists() && f.length() > 200) return
+        if (f != null && f.exists() && f.length() > 200) return true
         val nf = File(cacheDir, "cue_" + Math.abs(phrase.hashCode()) + ".wav")
         cueFiles[phrase] = nf
         if (!nf.exists() || nf.length() < 200) {
-            try {
+            // v1.30 (ревью): отказ synthesizeToFile (ERROR или исключение) приходит без onDone/
+            // onError — без отката pendingSynth залипал бы > 0, и каждое объявление шло бы с QUEUE_FLUSH
+            pendingSynth.incrementAndGet()
+            val ok = try {
                 t.setSpeechRate(0.95f)
-                t.synthesizeToFile(phrase, Bundle(), nf, "cuefile_$phrase")
-            } catch (_: Exception) {}
+                t.synthesizeToFile(phrase, Bundle(), nf, "cuefile_$phrase") == TextToSpeech.SUCCESS
+            } catch (_: Exception) { false }
+            if (!ok) { pendingSynth.decrementAndGet(); return false }
         }
+        return true
     }
 
     private var lastAnnouncedTarget: String? = null   // v0.51: имя адресата называем на СМЕНУ
@@ -653,19 +667,36 @@ class BridgeService : Service() {
     // работает простое правило: отвечаю тому, кто говорил последним. Слово юзера: «я выбрал
     // каналы в работу, между ними приоритет закреплять не надо».
     private var manualPinTs = 0L
+    // v1.16-fix (боевое, повторялось: «играет ответ Y, я на экране перехожу в X, озвучка кончилась,
+    // диктую, „отправляй“ — ушло в Y»). Три минуты считались от ТАПА, а длинный ответ Y
+    // (несколько частей, ожидание хвоста до 60с) играет дольше: к подъёму микрофона штамп
+    // протухал, и правило «последний говоривший» возвращало Y. Теперь выбор, сделанный ПОСЛЕ
+    // того, как заговорил последний говоривший, держится без срока — до отправки в него или до
+    // нового сообщения (новое сообщение = новый «последний говоривший», дальше снова три минуты).
+    // MAX до первой озвучки: восстановленное после рестарта закрепление выбором не считается.
+    private var speakerStartTs = Long.MAX_VALUE
+
+    private fun manualPinHolds(): Boolean =
+        manualPinTs > 0L &&
+            (System.currentTimeMillis() - manualPinTs < 180000 || manualPinTs >= speakerStartTs)
     // v0.54: фразы, которые надо сыграть, КАК ТОЛЬКО допишется их файл (синтез асинхронный).
     // Живой TTS на музыкальном канале звучит тише файла — на улице юзер его не слышит (урок v0.38).
     private val cuePlayWhenReady: MutableSet<String> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    // v1.30: объявление имени с QUEUE_FLUSH обрывает синтез ЖДАННОЙ фразы — раньше метка
+    // снималась в onStop и фраза пропадала совсем (страховка cue() видела пустую метку и молчала).
+    // Теперь один повтор синтеза; второй обрыв — метку снимаем, без петли.
+    private val cueResynthOnce: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
 
-    // Имена проектов приходят слагами (my_project) — озвучка читает подчёркивания вслух.
+    // Имена проектов приходят слагами (voicebridge_app) — озвучка читает подчёркивания вслух.
     private fun spoken(n: String) = n.replace('_', ' ').replace('-', ' ')
 
     // Произнести произвольную фразу громким путём: есть файл — играем, нет — синтезируем
     // и играем по готовности (см. onDone у cuefile_).
     private fun say(phrase: String) {
         if (phrase.isEmpty()) return
-        if (!Cfg.voiceCues || !ttsReady) { LogBus.add("реплики выключены, не сказал: $phrase"); return }
+        if (!Cfg.voiceCues || !ttsReady || Cfg.voiceOff) { LogBus.add(tr("реплики выключены, не сказал: $phrase", "cues are off, did not say: $phrase")); return }
         fun ready(f: File?) = f != null && f.exists() && f.length() > 200 &&
             System.currentTimeMillis() - f.lastModified() > 1200
         if (ready(cueFiles[phrase])) { playCueFile(cueFiles[phrase]!!); return }
@@ -674,6 +705,32 @@ class BridgeService : Service() {
         // v0.55 (ревью): файл мог остаться в кэше от ПРОШЛОГО запуска — тогда ensureCue ничего
         // не синтезирует, onDone не придёт, и фраза не прозвучит никогда («первый раз молчит»).
         if (ready(cueFiles[phrase]) && cuePlayWhenReady.remove(phrase)) playCueFile(cueFiles[phrase]!!)
+        // v1.17-fix: файл существует, но слишком свежий (< 1.2с) — ready() ложный, ensureCue()
+        // не пересинтезирует существующий файл, onDone не придёт, метка cuePlayWhenReady висит
+        // вечно → фраза молчит, и через kickPlayback блокирует следующие до 3с. Ждём дозревания.
+        else if (cuePlayWhenReady.contains(phrase)) {
+            val cf = cueFiles[phrase]
+            if (cf != null && cf.exists() && cf.length() > 200) {
+                val age = System.currentTimeMillis() - cf.lastModified()
+                val wait = maxOf(1300 - age, 200)
+                fun tryPlay(attempt: Int) {
+                    main.postDelayed({
+                        if (!cuePlayWhenReady.contains(phrase)) return@postDelayed
+                        val f2 = cueFiles[phrase]
+                        if (f2 != null && ready(f2)) {
+                            cuePendingUntil = System.currentTimeMillis() + 300
+                            if (cuePlayWhenReady.remove(phrase)) playCueFile(f2)
+                        } else if (attempt < 3) {
+                            tryPlay(attempt + 1)
+                        } else {
+                            cuePlayWhenReady.remove(phrase)
+                            LogBus.add(tr("фраза «$phrase» не дозрела после 3 попыток — пропускаю", "phrase “$phrase” not ready after 3 attempts — skipping"))
+                        }
+                    }, if (attempt == 1) wait else 500)
+                }
+                tryPlay(1)
+            }
+        }
     }
 
     // ── v0.54: голосовая рубка (слово юзера: «по номерам, и чтобы сначала зачитал, что есть») ──
@@ -688,11 +745,11 @@ class BridgeService : Service() {
 
     private fun speakSessionList() {
         val l = freshSessions()
-        if (l.isEmpty()) { say("сессий пока нет"); return }
+        if (l.isEmpty()) { say(tr("сессий пока нет", "no sessions yet")); return }
         cmdList = l
         cmdListTs = System.currentTimeMillis()
-        val ord = listOf("первая", "вторая", "третья", "четвёртая")
-        LogBus.add("рубка: " + l.mapIndexed { i, p -> "${i + 1}) ${p.second}" }.joinToString(", "))
+        val ord = listOf(tr("первая", "first"), tr("вторая", "second"), tr("третья", "third"), tr("четвёртая", "fourth"))
+        LogBus.add(tr("рубка: ", "switchboard: ") + l.mapIndexed { i, p -> "${i + 1}) ${p.second}" }.joinToString(", "))
         say(l.mapIndexed { i, p -> "${ord[i]}, ${spoken(p.second)}" }.joinToString(". "))
     }
 
@@ -763,12 +820,12 @@ class BridgeService : Service() {
     private fun switchByName(said: String) {
         val hit = matchSessionByName(said)
         if (hit == null) {
-            LogBus.add("рубка: не узнал имя «$said» — читаю список")
-            say("не понял, какую сессию")
+            LogBus.add(tr("рубка: не узнал имя «$said» — читаю список", "switchboard: did not recognize name “$said” — reading the list"))
+            say(tr("не понял, какую сессию", "didn't catch which session"))
             main.postDelayed({ if (alive) speakSessionList() }, 2500)
             return
         }
-        LogBus.add("рубка: «$said» → «${hit.second}»")
+        LogBus.add(tr("рубка: «$said» → «${hit.second}»", "switchboard: “$said” → “${hit.second}”"))
         // через единую точку: если сейчас идёт диктовка, начатое уедет СТАРОМУ адресату,
         // а переключение применится после подтверждения (v0.78)
         setReplyTargetManual(hit.first)
@@ -780,16 +837,16 @@ class BridgeService : Service() {
         // и «переключись на вторую» чужой ответ переставит список, и юзер уедет не туда.
         val l = if (cmdList.isNotEmpty() && System.currentTimeMillis() - cmdListTs < 180000) cmdList
                 else freshSessions()
-        if (n < 1 || n > l.size) { LogBus.add("рубка: сессии №$n нет"); say("такой сессии нет"); return }
+        if (n < 1 || n > l.size) { LogBus.add(tr("рубка: сессии №$n нет", "switchboard: no session #$n")); say(tr("такой сессии нет", "no such session")); return }
         val (sid, name) = l[n - 1]
-        LogBus.add("рубка: адресат теперь «$name»")
+        LogBus.add(tr("рубка: адресат теперь «$name»", "switchboard: target is now “$name”"))
         setReplyTargetManual(sid)   // v0.78: та же защита начатой диктовки
         lastAnnouncedTarget = sid   // имя прозвучало сейчас — на подъёме микрофона не повторять
     }
 
     private fun listenCuePhrase(): String {
         val n = replyTargetName()
-        return if (n.isEmpty() || n == "—") "слушаю" else "слушаю, " + spoken(n)
+        return if (n.isEmpty() || n == "—") tr("слушаю", "listening") else tr("слушаю, ", "listening, ") + spoken(n)
     }
 
     // v0.52 (боевое с самоката 30.07, дословно: «после ушло я не услышал вообще ничего… я так
@@ -804,7 +861,7 @@ class BridgeService : Service() {
         val n = if (sid.isNotEmpty())
             SessionBook.all().firstOrNull { it.sid == sid }?.proj.orEmpty()
         else replyTargetName()
-        return if (n.isEmpty() || n == "—") "ушло" else "ушло в " + spoken(n)
+        return if (n.isEmpty() || n == "—") tr("ушло", "sent") else tr("ушло в ", "sent to ") + spoken(n)
     }
 
     // Поверх звучащего ответа — только фраза, которая уже лежит файлом: иначе она уйдёт в
@@ -812,7 +869,7 @@ class BridgeService : Service() {
     private fun sentPhraseOverAnswer(sid: String): String {
         val full = sentBasePhrase(sid)
         val f = cueFiles[full]
-        return if (f != null && f.exists() && f.length() > 200) full else "ушло"
+        return if (f != null && f.exists() && f.length() > 200) full else tr("ушло", "sent")
     }
 
     // v0.83 (боевое: «ушло в X… слушаю… мета судья… — каша из фраз подряд»). Когда сразу
@@ -827,11 +884,11 @@ class BridgeService : Service() {
         val nname = nxt.optString("proj").ifEmpty { nsid.take(8) }
         val mid = nxt.optString("msgid")
         if (mid.isNotEmpty()) { announcedMsgId = mid; announcedProj = nname }
-        return base + ". дальше " + spoken(nname)
+        return base + tr(". дальше ", ". next, ") + spoken(nname)
     }
 
     private fun sentCuePhrase(sid: String = ""): String =
-        if (micAsleep) sentBasePhrase(sid) + ". микрофон спит" else sentBasePhrase(sid)
+        if (micAsleep) sentBasePhrase(sid) + tr(". микрофон спит", ". mic asleep") else sentBasePhrase(sid)
 
     // Обе формы «ушло» готовим заранее: какая понадобится, зависит от того, уснёт ли микрофон,
     // а на живом TTS реплика звучит тихо — ровно то, чего юзер на улице не слышит.
@@ -839,11 +896,11 @@ class BridgeService : Service() {
         ensureCue(listenCuePhrase())
         val b = sentBasePhrase()
         ensureCue(b)
-        ensureCue("$b. микрофон спит")
+        ensureCue(tr("$b. микрофон спит", "$b. mic asleep"))
     }
 
     private fun cue(text: String) {
-        if (!Cfg.voiceCues || !ttsReady) return
+        if (!Cfg.voiceCues || !ttsReady || Cfg.voiceOff) return
         val f = cueFiles[text]
         // v0.51: имена реплик теперь заводятся на лету (под имя адресата), а synthesizeToFile
         // асинхронен — недописанный wav играть нельзя, он звучит обрывком или молчит.
@@ -865,7 +922,7 @@ class BridgeService : Service() {
         if (cuePlayWhenReady.size < 4) {
             cuePlayWhenReady.add(text)
             ensureCue(text)
-            LogBus.add("реплика «${text.take(40)}» синтезируется — сыграю целиком, когда будет готова")
+            LogBus.add(tr("реплика «${text.take(40)}» синтезируется — сыграю целиком, когда будет готова", "cue “${text.take(40)}” is being synthesized — will play whole when ready"))
             // страховка: синтез мог не запуститься (движок занят) — снимем метку, чтобы
             // гейт воспроизведения не держал очередь вечно (аудит: залипание cuePlayWhenReady)
             main.postDelayed({
@@ -901,6 +958,7 @@ class BridgeService : Service() {
     private fun playCueFile(f: File) {
         main.post {
             if (!alive) return@post
+            if (Cfg.voiceOff) { cueQueue.clear(); cuePlayWhenReady.clear(); return@post }   // v1.28
             // v1.07 (слово юзера: «пауза — это тишина, ничего не должно звучать, включая
             // системные фразы»): на паузе реплика ждёт в очереди и прозвучит, когда ты
             // сам снимешь паузу. Раньше она играла поверх тишины и ломала ожидание.
@@ -1024,16 +1082,16 @@ class BridgeService : Service() {
             val key = cueFiles.entries.firstOrNull { it.value.absolutePath == f.absolutePath }?.key
             if (key != null) cueFiles.remove(key)
             if (f.exists()) f.delete()
-            LogBus.add("битый файл реплики выброшен — пересинтезирую при следующей")
+            LogBus.add(tr("битый файл реплики выброшен — пересинтезирую при следующей", "broken cue file discarded — will resynthesize next time"))
         } catch (_: Exception) {}
     }
 
     private fun queueCue(f: File) {
-        val isSent = cueFiles.entries.any { it.key.startsWith("ушло") && it.value.absolutePath == f.absolutePath }
+        val isSent = cueFiles.entries.any { it.key.startsWith(tr("ушло", "sent")) && it.value.absolutePath == f.absolutePath }
         if (!isSent && cueQueue.any { it.absolutePath == f.absolutePath }) return
         if (cueQueue.size >= 4) {
             cueQueue.poll()
-            LogBus.add("очередь реплик полна — выбросил самую старую")
+            LogBus.add(tr("очередь реплик полна — выбросил самую старую", "cue queue full — dropped the oldest"))
         }
         cueQueue.addLast(f)
     }
@@ -1083,7 +1141,7 @@ class BridgeService : Service() {
     private fun armCueHoldGuard() {
         main.postDelayed({
             if (cueHold && System.currentTimeMillis() - cueHoldSince >= 12000) {
-                LogBus.add("реплика держала ответ дольше 12с — отпускаю")
+                LogBus.add(tr("реплика держала ответ дольше 12с — отпускаю", "cue held the reply longer than 12s — releasing"))
                 releaseCueHold()
             }
         }, 12000)
@@ -1141,9 +1199,9 @@ class BridgeService : Service() {
                 start()
             }
             grabMediaButtons()
-            LogBus.add("держу кнопку за собой (беззвучный поток)")
+            LogBus.add(tr("держу кнопку за собой (беззвучный поток)", "holding the button for myself (silent stream)"))
         } catch (e: Exception) {
-            LogBus.add("беззвучный поток не поднялся: ${e.message}")
+            LogBus.add(tr("беззвучный поток не поднялся: ${e.message}", "silent stream failed to start: ${e.message}"))
             silentKeeper = null
         }
     }
@@ -1165,7 +1223,7 @@ class BridgeService : Service() {
                 NotificationChannel(CH, "Claudio Code", NotificationManager.IMPORTANCE_LOW)
             )
         }
-        val n = buildNotification(if (Cfg.handsFree) "безрукий режим" else "кнопочный режим")
+        val n = buildNotification(if (Cfg.handsFree) tr("безрукий режим", "hands-free mode") else tr("кнопочный режим", "button mode"))
         if (Build.VERSION.SDK_INT >= 29) {
             // MICROPHONE type only when the permission is actually granted —
             // otherwise Android 14+ throws SecurityException at startForeground.
@@ -1179,7 +1237,7 @@ class BridgeService : Service() {
                 // не даёт mic-тип из фона, и рация «слышала тишину» до перезапуска руками.
                 // Теперь флаг + повторный апгрейд при выходе приложения на экран (ensureMicFgs).
                 micTypeDegraded = true
-                LogBus.add("система не дала микрофонный тип из фона — открой приложение, чтобы вернуть слух")
+                LogBus.add(tr("система не дала микрофонный тип из фона — открой приложение, чтобы вернуть слух", "system denied the microphone type from background — open the app to restore hearing"))
                 startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
             }
         } else {
@@ -1193,11 +1251,11 @@ class BridgeService : Service() {
     fun onWhisperToggled(nowOn: Boolean) {
         if (nowOn) {
             val t = draft.toString().trim()
-            if (t.isNotEmpty()) { draft.setLength(0); LogBus.add("черновик распознавателя дошлю перед переключением"); send(t) }
+            if (t.isNotEmpty()) { draft.setLength(0); LogBus.add(tr("черновик распознавателя дошлю перед переключением", "will send the recognizer draft before switching")); send(t) }
         } else {
             // uttSpeechMs ловит уже отгруженные сегменты, lastVoiceTs — речь в текущем буфере
             if (recThread != null && (uttSpeechMs > 0 || System.currentTimeMillis() - lastVoiceTs < 5000)) {
-                LogBus.add("закрываю whisper-черновик перед переключением")
+                LogBus.add(tr("закрываю whisper-черновик перед переключением", "closing the whisper draft before switching"))
                 finalizeReq = true
             }
         }
@@ -1207,7 +1265,7 @@ class BridgeService : Service() {
     fun ensureMicFgs() {
         if (micTypeDegraded && hasMicPermission()) {
             startInForeground()
-            if (!micTypeDegraded) LogBus.add("микрофонный тип FGS восстановлен")
+            if (!micTypeDegraded) LogBus.add(tr("микрофонный тип FGS восстановлен", "FGS microphone type restored"))
         }
     }
 
@@ -1236,9 +1294,9 @@ class BridgeService : Service() {
     private fun updateNotification() {
         if (!alive) return
         val state = when {
-            playing -> "играю ответ"
-            listening -> "слушаю"
-            else -> if (Cfg.handsFree) "безрукий режим" else "кнопочный режим"
+            playing -> tr("играю ответ", "playing reply")
+            listening -> tr("слушаю", "listening")
+            else -> if (Cfg.handsFree) tr("безрукий режим", "hands-free mode") else tr("кнопочный режим", "button mode")
         }
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
             .notify(1, buildNotification(state))
@@ -1267,7 +1325,7 @@ class BridgeService : Service() {
         // scoStarted не давал вернуть SCO при возврате гарнитуры.
         if (listening && scoStarted) {
             scoStarted = false
-            LogBus.add("гарнитура пропала во время диктовки — пишу с телефона, вернётся — переключусь")
+            LogBus.add(tr("гарнитура пропала во время диктовки — пишу с телефона, вернётся — переключусь", "headset disappeared during dictation — recording from the phone, will switch back when it returns"))
             buzz(500)
         }
         if (!playing) return
@@ -1290,14 +1348,14 @@ class BridgeService : Service() {
             flushCueQueue()  // v1.13: реплики, отложенные паузой, обязаны выйти
             main.removeCallbacks(unpauseGuard)
             abandonFocus()
-            LogBus.add("наушники отключились — жду наушники")
+            LogBus.add(tr("наушники отключились — жду наушники", "headphones disconnected — waiting for headphones"))
         } else {
             pausedAtMs = pos
             playing = false
             paused = true    // снимается ЛЮБОЙ кнопкой (контракт v0.14) или возвратом наушников
             main.removeCallbacks(unpauseGuard)   // в динамик сам не продолжаю — без 90с-сторожа
             abandonFocus()
-            LogBus.add("наушники отключились — пауза (кнопка или наушники продолжат)")
+            LogBus.add(tr("наушники отключились — пауза (кнопка или наушники продолжат)", "headphones disconnected — paused (button or headphones will resume)"))
         }
         updateNotification()
     }
@@ -1328,7 +1386,7 @@ class BridgeService : Service() {
                 }
             }
         } catch (e: Exception) {
-            LogBus.add("bt-микрофон: ${e.message}")
+            LogBus.add(tr("bt-микрофон: ${e.message}", "bt microphone: ${e.message}"))
         }
     }
 
@@ -1359,7 +1417,7 @@ class BridgeService : Service() {
             if (dev != null && headsetPresent() &&
                 dev.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO && dev.type != 26
             ) {
-                LogBus.add("внимание: пишу с микрофона телефона, не гарнитуры")
+                LogBus.add(tr("внимание: пишу с микрофона телефона, не гарнитуры", "warning: recording from the phone microphone, not the headset"))
             }
         } catch (_: Exception) {}
     }
@@ -1412,7 +1470,7 @@ class BridgeService : Service() {
                         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                     )
                 )
-            } catch (e: Exception) { LogBus.add("медиакнопки: ${e.message}") }
+            } catch (e: Exception) { LogBus.add(tr("медиакнопки: ${e.message}", "media buttons: ${e.message}")) }
             setPlaybackState(
                 PlaybackStateCompat.Builder()
                     .setActions(
@@ -1426,14 +1484,14 @@ class BridgeService : Service() {
                     .build()
             )
             setCallback(object : MediaSessionCompat.Callback() {
-                override fun onPlay() { main.post { if (alive) { LogBus.add("кнопка: play"); onButton() } } }
-                override fun onPause() { main.post { if (alive) { LogBus.add("кнопка: pause"); onButton() } } }
+                override fun onPlay() { main.post { if (alive) { LogBus.add(tr("кнопка: play", "button: play")); onButton() } } }
+                override fun onPause() { main.post { if (alive) { LogBus.add(tr("кнопка: pause", "button: pause")); onButton() } } }
                 override fun onSkipToNext() { main.post { if (alive && !resumeIfPaused()) { if (playing) stopPlayback(thenListen = true) else onCancel() } } }
                 override fun onSkipToPrevious() { main.post { if (alive && !resumeIfPaused()) replayLast() } }
                 override fun onMediaButtonEvent(mbIntent: Intent): Boolean {
                     // v0.43 диагностика: логируем ЛЮБОЙ дошедший медиаинтент — если этой строки
                     // нет при нажатии, значит система не доставляет нажатие сессии ВООБЩЕ
-                    LogBus.add("медиасобытие дошло до рации")
+                    LogBus.add(tr("медиасобытие дошло до рации", "media event reached the radio"))
                     val ev: KeyEvent = if (Build.VERSION.SDK_INT >= 33)
                         mbIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
                             ?: return false
@@ -1454,7 +1512,7 @@ class BridgeService : Service() {
                         if (btnGhostPress) {
                             btnGhostPress = false
                             btnLongTimer?.let { main.removeCallbacks(it) }   // v0.36 (ревью): страховка от ложного долгого
-                            LogBus.add("  (дребезг — хвост того же жеста)")
+                            LogBus.add(tr("  (дребезг — хвост того же жеста)", "  (bounce — tail of the same gesture)"))
                             return true
                         }
                         btnLongTimer?.let { main.removeCallbacks(it) }
@@ -1466,7 +1524,7 @@ class BridgeService : Service() {
                     }
                     if (ev.action == KeyEvent.ACTION_DOWN) {
                         // v0.12 диагностика «кнопки не работают»: видно, ДОХОДИТ ли нажатие и каким кодом
-                        LogBus.add("кнопка: код ${ev.keyCode}${if (ev.repeatCount > 0) " (повтор)" else ""}")
+                        LogBus.add(tr("кнопка: код ${ev.keyCode}${if (ev.repeatCount > 0) " (повтор)" else ""}", "button: code ${ev.keyCode}${if (ev.repeatCount > 0) " (repeat)" else ""}"))
                         // v0.16 («иногда отправляет, иногда нет — разницы не вижу»): гарнитуры
                         // шлют ОДНО нажатие несколькими событиями (напр. 127 и следом 79). Второе
                         // прилетало в окно двойного нажатия и трактовалось как отмена — черновик
@@ -1474,7 +1532,7 @@ class BridgeService : Service() {
                         val nowBtn = System.currentTimeMillis()
                         if (nowBtn - lastBtnTs < 150) {
                             btnGhostPress = true   // v0.36: и его UP отбросить тоже
-                            LogBus.add("  (дребезг — тот же жест, пропускаю)")
+                            LogBus.add(tr("  (дребезг — тот же жест, пропускаю)", "  (bounce — same gesture, skipping)"))
                             return true
                         }
                         lastBtnTs = nowBtn
@@ -1512,7 +1570,7 @@ class BridgeService : Service() {
                                     if (!alive) return@post
                                     when {
                                         playing -> stopPlayback(thenListen = true)
-                                        listening && draft.isNotEmpty() -> { LogBus.add("кнопка (правая) — отправляю"); beginSend() }
+                                        listening && draft.isNotEmpty() -> { LogBus.add(tr("кнопка (правая) — отправляю", "button (right) — sending")); beginSend() }
                                         else -> onCancel()
                                     }
                                 }
@@ -1544,7 +1602,8 @@ class BridgeService : Service() {
         // v0.51: главный открытый вопрос по v0.50 — доходит ли кнопка гарнитуры ПОСЛЕ засыпания
         // микрофона. Строка отвечает на него одним взглядом в журнал, без гаданий.
         // (ревью: micAsleep живёт и во время озвучки — без гейта строка врала бы на каждой паузе)
-        if (micAsleep && !playing && !paused) LogBus.add("кнопка дошла во сне — бужу микрофон")
+        if (micAsleep && !playing && !paused) LogBus.add(tr("кнопка дошла во сне — бужу микрофон", "button arrived while asleep — waking the microphone"))
+        if (Cfg.voiceOff) { toggleVoiceOff(); return }   // v1.28: тап/кнопка при выключенном голосе — вернуть голос
         if (dictHold && !listening && !playing) { toggleMicMute(); return }  // v0.43: кнопка будит из mute
         if (resumeIfPaused()) return
         if (playing) {
@@ -1592,7 +1651,7 @@ class BridgeService : Service() {
             }
             // v1.08 (слово юзера: «лучше пусть выключится, чем включится посреди дел»):
             // не продолжаем сами — гасим микрофон и оставляем паузу. Продолжишь ты.
-            LogBus.add("пауза висит полчаса — усыпляю микрофон, озвучка ждёт твоей команды")
+            LogBus.add(tr("пауза висит полчаса — усыпляю микрофон, озвучка ждёт твоей команды", "pause has hung for half an hour — putting the microphone to sleep, playback waits for your command"))
             if (listening) stopListening()
             micAsleep = true
             noAutoWakeUntil = System.currentTimeMillis() + 600000
@@ -1608,10 +1667,10 @@ class BridgeService : Service() {
     // v0.32 (слово юзера: нужен жест и на долгое нажатие): полный стоп всего — озвучка,
     // очередь, черновик, микрофон. Один жест «заглушить рацию немедленно».
     fun onLongPress() {
-        LogBus.add("долгое нажатие — полный стоп")
+        LogBus.add(tr("долгое нажатие — полный стоп", "long press — full stop"))
         if (playing) stopPlayback(false)
         if (listening) { draft.setLength(0); stopListening() }
-        cue("стоп")
+        cue(tr("стоп", "stop"))
         buzz(400)
     }
 
@@ -1628,7 +1687,7 @@ class BridgeService : Service() {
         // STATE_PLAYING и сразу перезабираем приоритет: для системы мы всё ещё активный плеер.
         grabMediaButtons()
         beepBoth(ToneGenerator.TONE_PROP_BEEP, 90)
-        LogBus.add("пауза — кнопка продолжит с этого места")
+        LogBus.add(tr("пауза — кнопка продолжит с этого места", "pause — button will resume from this point"))
         updateNotification()
     }
 
@@ -1658,12 +1717,12 @@ class BridgeService : Service() {
         } catch (_: Exception) { false }
         val f = currentFile
         if (!ok && f != null && f.exists()) {
-            LogBus.add("плеер умер в паузе — переигрываю с ${pausedAtMs / 1000}с")
+            LogBus.add(tr("плеер умер в паузе — переигрываю с ${pausedAtMs / 1000}с", "player died in pause — replaying from ${pausedAtMs / 1000}s"))
             playing = true
             playFile(f, seekTo = pausedAtMs)
             ok = true
         }
-        LogBus.add(if (ok) "продолжаю с ${pausedAtMs / 1000}с" else "продолжать нечего — беру следующее")
+        LogBus.add(if (ok) tr("продолжаю с ${pausedAtMs / 1000}с", "resuming from ${pausedAtMs / 1000}s") else tr("продолжать нечего — беру следующее", "nothing to resume — taking the next"))
         if (!ok) { playing = false; kickPlayback() }
         updateNotification()
     }
@@ -1694,8 +1753,8 @@ class BridgeService : Service() {
         abandonFocus()
         beepBoth(ToneGenerator.TONE_PROP_BEEP, 120)
         LogBus.add(
-            if (thenListen) "озвучка прервана — диктуй (повтор ответа: тройное нажатие)"
-            else "озвучка остановлена (повтор — тройное нажатие / кнопка)"
+            if (thenListen) tr("озвучка прервана — диктуй (повтор ответа: тройное нажатие)", "playback interrupted — dictate (replay the reply: triple press)")
+            else tr("озвучка остановлена (повтор — тройное нажатие / кнопка)", "playback stopped (replay — triple press / button)")
         )
         updateNotification()
         if (thenListen) main.postDelayed({ if (alive && !playing && !listening) startListening() }, 700)
@@ -1711,15 +1770,19 @@ class BridgeService : Service() {
         if (!Cfg.handsFree) stopListening()
         beepBoth(ToneGenerator.TONE_PROP_NACK, 250)
         buzz(220)                     // v0.26: длинный толчок = стёрли
-        cue("отменено")
-        LogBus.add("черновик очищен")
+        // v1.41: части, дорезанные потолком, уже доехали — стёрт только хвост
+        val partsGone = takePartDebt(listenStartedAt).isNotEmpty()
+        if (!partsGone) noteEndedOwing(listenStartedAt)
+        cue(if (partsGone) tr("начало ушло, хвост отменён", "start sent, tail cancelled") else tr("отменено", "cancelled"))
+        LogBus.add(tr("черновик очищен", "draft cleared"))
         kickPlayback()   // v0.5.3: черновика нет — выпустить отложенный ответ
     }
 
     fun replayLast() {
         if (playing) return
-        if (lastBatch.isEmpty()) { LogBus.add("повторять нечего"); return }
-        LogBus.add("повторяю последнее (${lastBatch.size} ч.)")
+        if (lastBatch.isEmpty()) { LogBus.add(tr("повторять нечего", "nothing to repeat")); return }
+        if (Cfg.voiceOff) toggleVoiceOff(announce = false)   // v1.28: явный «повтор» = хочу слышать
+        LogBus.add(tr("повторяю последнее (${lastBatch.size} ч.)", "repeating the last (${lastBatch.size} parts)"))
         for (f in lastBatch) if (f.exists()) fileQueue.addLast(f)
         kickPlayback()
     }
@@ -1731,26 +1794,26 @@ class BridgeService : Service() {
         val who = lastProj?.takeIf { it.isNotEmpty() }
         val waiting = playQueue.mapNotNull { it.optString("proj").takeIf { p -> p.isNotEmpty() } }.distinct()
         return when {
-            paused -> "ПАУЗА" + (who?.let { " · $it" } ?: "")
-            playing -> "ИГРАЮ" + (who?.let { " · $it" } ?: " ОТВЕТ")
-            listening && (draft.isNotEmpty() || uttSpeechMs > 600) -> "СЛУШАЮ · есть черновик"
-            listening -> "СЛУШАЮ"
-            dictHold -> "ПАУЗА ДИКТОВКИ · черновик цел"
+            paused -> tr("ПАУЗА", "PAUSED") + (who?.let { " · $it" } ?: "")
+            playing -> tr("ИГРАЮ", "PLAYING") + (who?.let { " · $it" } ?: tr(" ОТВЕТ", " REPLY"))
+            listening && (draft.isNotEmpty() || uttSpeechMs > 600) -> tr("СЛУШАЮ · есть черновик", "LISTENING · draft in progress")
+            listening -> tr("СЛУШАЮ", "LISTENING")
+            dictHold -> tr("ПАУЗА ДИКТОВКИ · черновик цел", "DICTATION PAUSED · draft kept")
             // v0.36 (аудит): плашка врала «НА СВЯЗИ» при мёртвом релее — теперь честно
-            !wsUp -> "НЕТ СВЯЗИ — переподключаюсь"
+            !wsUp -> tr("НЕТ СВЯЗИ — переподключаюсь", "OFFLINE — reconnecting")
             // v0.51 (хвост №3): с включённым тумблером «только в наушниках» и без гарнитуры
             // ответы копятся молча, и рация выглядит сломанной. Плашка обязана назвать причину.
             (playQueue.isNotEmpty() || fileQueue.isNotEmpty()) && holdForHeadset() ->
-                "ЖДУ НАУШНИКИ (${playQueue.size + fileQueue.size}) · выключи «только в наушниках»"
+                tr("ЖДУ НАУШНИКИ (${playQueue.size + fileQueue.size}) · выключи «только в наушниках»", "WAITING FOR HEADPHONES (${playQueue.size + fileQueue.size}) · turn off “headphones only”")
             playQueue.isNotEmpty() || fileQueue.isNotEmpty() -> {
                 val n = playQueue.size + fileQueue.size
-                "ЖДЁТ ОТВЕТ ($n)" + (if (waiting.isNotEmpty()) " · " + waiting.joinToString(", ") else "")
+                tr("ЖДЁТ ОТВЕТ ($n)", "AWAITING REPLY ($n)") + (if (waiting.isNotEmpty()) " · " + waiting.joinToString(", ") else "")
             }
             // v0.49: накопленное не играет само и не держит микрофон — ждёт команды «слушать»
-            heldQueue.isNotEmpty() -> "НАКОПИЛОСЬ (${heldQueue.size}) · жми «слушать» · микрофон свободен"
+            heldQueue.isNotEmpty() -> tr("НАКОПИЛОСЬ (${heldQueue.size}) · жми «слушать» · микрофон свободен", "WAITING (${heldQueue.size}) · press “listen” · mic is free")
             // v0.50: состояние после отправки должно быть ВИДНО, а не угадываться
-            micAsleep -> "ОТПРАВЛЕНО · микрофон спит · жми, чтобы сказать ещё"
-            else -> "НА СВЯЗИ"
+            micAsleep -> tr("ОТПРАВЛЕНО · микрофон спит · жми, чтобы сказать ещё", "SENT · mic asleep · press to say more")
+            else -> tr("НА СВЯЗИ", "ONLINE")
         }
     }
 
@@ -1766,15 +1829,15 @@ class BridgeService : Service() {
         dictHold = true
         stopListening()
         buzz(90)
-        cue("пауза")
-        LogBus.add("диктовка на паузе — черновик цел, тап по плашке продолжит")
+        cue(tr("пауза", "paused"))
+        LogBus.add(tr("диктовка на паузе — черновик цел, тап по плашке продолжит", "dictation paused — draft intact, tap the banner to resume"))
     }
 
     fun hasPendingDictation(): Boolean = dictHold
     fun resumeDictation() {
         touchUser()
         dictHold = false
-        LogBus.add("продолжаю диктовку в то же сообщение")
+        LogBus.add(tr("продолжаю диктовку в то же сообщение", "continuing dictation into the same message"))
         startListening()
     }
 
@@ -1786,19 +1849,49 @@ class BridgeService : Service() {
         touchUser()
         if (isMicMuted()) {                 // разглушить — поднять микрофон
             dictHold = false
-            LogBus.add("поднимаю микрофон")
+            LogBus.add(tr("поднимаю микрофон", "raising the microphone"))
             startListening()
             return false
         }
         dictHold = true                     // заглушить — окружение больше не пишется
         if (listening) stopListening()
         buzz(120)
-        cue("микрофон выключен")
-        LogBus.add("микрофон заглушён — слушаю только ответы; тап вернёт микрофон")
+        cue(tr("микрофон выключен", "microphone off"))
+        LogBus.add(tr("микрофон заглушён — слушаю только ответы; тап вернёт микрофон", "microphone muted — listening to replies only; tap to bring the microphone back"))
         updateNotification()
         return true
     }
     fun isMicMuted(): Boolean = dictHold && !listening
+
+    // v1.28 (слово юзера 10.10): голос выкл — переписка без звука. Сервис остаётся на связи:
+    // лента, список каналов и набор текста работают; ничего не играет, микрофон не встаёт.
+    fun toggleVoiceOff(announce: Boolean = true): Boolean {
+        touchUser()
+        if (Cfg.voiceOff) {
+            Cfg.voiceOff = false
+            Cfg.save(this)
+            LogBus.add(tr("голос включён", "voice on"))
+            if (announce) cue(tr("голос включён", "voice on"))   // one phrase per event: callers that play right after pass false
+            updateNotification()
+            return false
+        }
+        buzz(120)   // no spoken cue: voice is going silent
+        // an open dictation is discarded, not sent: "voice off" reads as "stop recording me",
+        // and a false send costs more than a lost phrase (law of dictation)
+        if (Cfg.whisper && recThread != null) cancelReq = true
+        else if (uttId.isNotEmpty()) {   // mic already down but the utterance is still open on the server
+            postCancel(uttId); uttId = ""; uttSpeechMs = 0; whArmedMs = 0L
+        }
+        Cfg.voiceOff = true
+        Cfg.save(this)
+        cueQueue.clear(); cuePlayWhenReady.clear()
+        if (listening) stopListening(keepButton = true)
+        if (playing || paused || playQueue.isNotEmpty() || fileQueue.isNotEmpty()) stopPlayback()
+        startSilentKeepalive()   // the headset button needs a playing (silent) stream to reach us
+        LogBus.add(tr("голос выключен: ответы только в ленте, микрофон не поднимается", "voice off: replies in the feed only, microphone stays down"))
+        updateNotification()
+        return true
+    }
 
     // v0.19 (слово юзера «мне в принципе нет кнопки» + «нужно понимать, в какую сессию отвечаю»):
     // прямая отправка с экрана, без 600мс-ожидания двойного нажатия, и имя адресата для плашки.
@@ -1807,7 +1900,7 @@ class BridgeService : Service() {
     // вовсе, и нажатие выглядело как «ничего не произошло». Теперь: есть черновик — уходит сразу.
     fun sendNow() {
         touchUser()
-        if (!listening) { LogBus.add("нечего отправлять — диктовка не идёт"); return }
+        if (!listening) { LogBus.add(tr("нечего отправлять — диктовка не идёт", "nothing to send — no dictation in progress")); return }
         if (Cfg.whisper) { beginSend(); return }
         var msg = draft.toString().trim()
         // v0.30/v0.46-fix: финала нет, но догадка свежая — шлём её. У ручной отправки СВОЁ окно
@@ -1819,18 +1912,18 @@ class BridgeService : Service() {
                 cancelAutoSend(); resetSendWindow()
                 draft.setLength(0); lastPartial = ""
                 beepBoth(ToneGenerator.TONE_PROP_NACK, 250)
-                LogBus.add("отмена по голосу (догадка) — черновик пуст")
+                LogBus.add(tr("отмена по голосу (догадка) — черновик пуст", "voice cancel (guess) — draft is empty"))
                 return
             }
             msg = c
-            if (msg.isNotEmpty()) LogBus.add("финала не было — отправляю распознанное на лету")
+            if (msg.isNotEmpty()) LogBus.add(tr("финала не было — отправляю распознанное на лету", "no final result — sending what was recognized on the fly"))
         }
         if (msg.isEmpty()) { beginSend(); return }   // совсем пусто — дать распознавателю дошептать
         cancelAutoSend()
         resetSendWindow()   // v0.46: мысль ушла — абсолютный потолок считается с новой
         draft.setLength(0)
         lastPartial = ""
-        LogBus.add("кнопка — отправляю сразу")
+        LogBus.add(tr("кнопка — отправляю сразу", "button — sending immediately"))
         send(msg)
         try { recognizer?.cancel() } catch (_: Exception) {}
         sleepAfterSend()   // v0.50: одно сообщение на ответ — микрофон спит до кнопки/ответа
@@ -1872,7 +1965,7 @@ class BridgeService : Service() {
         if (sid == Cfg.replyTarget) {
             // повтор того же выбора: молчать нельзя — юзер повторяет команду, решив, что не дошло
             onReplyTargetPicked()
-            say("отвечаю в " + spoken(replyTargetName()))
+            say(tr("отвечаю в ", "replying to ") + spoken(replyTargetName()))
             if (thenListen) raiseMicFor(sid)
             return
         }
@@ -1884,8 +1977,8 @@ class BridgeService : Service() {
             pendingTargetListen = thenListen
             pendingCloseUtt = uttId
             val to = SessionBook.all().firstOrNull { it.sid == sid }?.proj?.ifEmpty { sid.take(8) } ?: sid.take(8)
-            LogBus.add("сначала дошлю начатое в «${replyTargetName()}», потом переключусь на «$to»")
-            cue("отправляю начатое, потом переключусь")
+            LogBus.add(tr("сначала дошлю начатое в «${replyTargetName()}», потом переключусь на «$to»", "will first send what was started to “${replyTargetName()}”, then switch to “$to”"))
+            cue(tr("отправляю начатое, потом переключусь", "sending what you started, then switching"))
             buzz(180)
             if (Cfg.whisper) {
                 // рекордер между циклами finalizeReq не увидит (startWhisperCycle его затрёт) —
@@ -1912,8 +2005,8 @@ class BridgeService : Service() {
         lastAnnouncedTarget = null
         ensureTargetCues()
         val n = replyTargetName()
-        LogBus.add("адресат: «$n»")
-        say("отвечаю в " + spoken(n))
+        LogBus.add(tr("адресат: «$n»", "target: “$n”"))
+        say(tr("отвечаю в ", "replying to ") + spoken(n))
         // имя адресата уже прозвучало — реплика подъёма микрофона повторила бы его же
         suppressListenCueUntil = System.currentTimeMillis() + 8000
     }
@@ -1934,6 +2027,7 @@ class BridgeService : Service() {
     }
 
     private fun raiseMicFor(sid: String) {
+        if (Cfg.voiceOff) toggleVoiceOff(announce = false)   // v1.28
         dictHold = false
         if (boundarySid != null) boundaryHoldUntil = System.currentTimeMillis() + 12000
         if (playing || paused) stopPlayback(thenListen = true)
@@ -1954,7 +2048,8 @@ class BridgeService : Service() {
     // Поэтому solo — ПРАВИЛО, а не снимок: звучит ровно один sid, всё остальное молчит всегда.
     private fun audible(sid: String): Boolean =
         // v0.82: набор рабочих каналов — правило. Пусто — слышу всех, кроме выключенных.
-        if (Cfg.pickedSids.isNotEmpty()) picked().contains(sid) else !SessionBook.isMuted(sid)
+        // v1.28: голос выключен — не звучит никто, ответы остаются в ленте
+        if (Cfg.voiceOff) false else if (Cfg.pickedSids.isNotEmpty()) picked().contains(sid) else !SessionBook.isMuted(sid)
 
     // ── v0.82: НАБОР рабочих каналов (solo = набор из одного) ────────────
     fun picked(): Set<String> =
@@ -2002,6 +2097,7 @@ class BridgeService : Service() {
             val cur = Cfg.replyTarget
             if (cur.isEmpty() || !picked().contains(cur)) {
                 Cfg.replyTarget = sid
+                manualPinTs = 0L   // v1.16-fix: штамп был выбором ДРУГОГО канала — не наследуем
                 Cfg.save(this)
                 lastAnnouncedTarget = null
                 ensureTargetCues()
@@ -2009,12 +2105,13 @@ class BridgeService : Service() {
         } else if (Cfg.replyTarget == sid) {
             // адресат не должен убегать ЗА пределы набора — иначе говоришь туда, чего не слышишь
             Cfg.replyTarget = picked().firstOrNull() ?: ""
+            manualPinTs = 0L
             Cfg.save(this)
             ensureTargetCues()
         }
         val n = picked().size
-        LogBus.add(if (n == 0) "работаю со всеми каналами" else "работаю с $n: ${pickedNames()}")
-        cue(if (n == 0) "слушаю все каналы" else if (nowIn) "добавил " + spoken(nameOf(sid)) else "убрал " + spoken(nameOf(sid)))
+        LogBus.add(if (n == 0) tr("работаю со всеми каналами", "working with all channels") else tr("работаю с $n: ${pickedNames()}", "working with $n: ${pickedNames()}"))
+        cue(if (n == 0) tr("слушаю все каналы", "listening to all channels") else if (nowIn) tr("добавил ", "added ") + spoken(nameOf(sid)) else tr("убрал ", "removed ") + spoken(nameOf(sid)))
         if (n > 0) { dropForeign(playQueue); dropForeign(heldQueue) }
         updateNotification()
         return nowIn
@@ -2053,15 +2150,15 @@ class BridgeService : Service() {
             lastAnnouncedTarget = null
             ensureTargetCues()
         }
-        LogBus.add("«${proj}» продолжился под новым номером — перенёс выбор со старого")
-        cue("канал " + spoken(proj) + " продолжается")
+        LogBus.add(tr("«${proj}» продолжился под новым номером — перенёс выбор со старого", "“${proj}” continued under a new number — carried the selection over from the old one"))
+        cue(tr("канал ", "channel ") + spoken(proj) + tr(" продолжается", " continues"))
         updateNotification()
     }
 
     private fun soloName(): String {
         val p = picked()
         if (p.isEmpty()) return "—"
-        return if (p.size == 1) nameOf(p.first()) else "${p.size} канала"
+        return if (p.size == 1) nameOf(p.first()) else tr("${p.size} канала", "${p.size} channels")
     }
 
     fun soloActive(): Boolean = Cfg.pickedSids.isNotEmpty()
@@ -2080,8 +2177,8 @@ class BridgeService : Service() {
         val dropped = dropForeign(playQueue) + dropForeign(heldQueue)
         if (playing && lastSession != null && lastSession != sid) stopPlayback(false)
         ensureTargetCues()
-        LogBus.add("слушаю только «${soloName()}»" + (if (dropped > 0) ", выбросил чужих частей: $dropped" else ""))
-        cue("слушаю только " + soloName())
+        LogBus.add(tr("слушаю только «${soloName()}»", "listening only to “${soloName()}”") + (if (dropped > 0) tr(", выбросил чужих частей: $dropped", ", dropped parts from others: $dropped") else ""))
+        cue(tr("слушаю только ", "listening only to ") + soloName())
         updateNotification()
     }
 
@@ -2093,8 +2190,8 @@ class BridgeService : Service() {
         // разглушать тринадцать строк в списке на ходу — не вариант.
         var un = 0
         for (s in SessionBook.all()) if (s.muted) { SessionBook.setMuted(this, s.sid, false); un++ }
-        LogBus.add("слушаю снова все сессии" + (if (un > 0) ", снял мьют с $un" else ""))
-        cue("слушаю все сессии")
+        LogBus.add(tr("слушаю снова все сессии", "listening to all sessions again") + (if (un > 0) tr(", снял мьют с $un", ", unmuted $un") else ""))
+        cue(tr("слушаю все сессии", "listening to all sessions"))
         updateNotification()
     }
 
@@ -2107,8 +2204,8 @@ class BridgeService : Service() {
         savePicked(setOf(sid))
         val dropped = dropForeign(playQueue) + dropForeign(heldQueue)
         if (playing && lastSession != null && lastSession != sid) stopPlayback(false)
-        LogBus.add("рубка: слушаю теперь только «${soloName()}»" +
-            (if (dropped > 0) ", выброшено чужих частей: $dropped" else ""))
+        LogBus.add(tr("рубка: слушаю теперь только «${soloName()}»", "switchboard: now listening only to “${soloName()}”") +
+            (if (dropped > 0) tr(", выброшено чужих частей: $dropped", ", parts from others dropped: $dropped") else ""))
     }
 
     private fun dropForeign(q: ArrayDeque<JSONObject>): Int {
@@ -2136,23 +2233,31 @@ class BridgeService : Service() {
     // «беззвучной паузе» плеер намеренно крутится дальше, чтобы не рвать поток на гарнитуру.
     // Наружу отдаём замороженную позицию — ту, с которой продолжим.
     fun positionMs(): Int = try {
-        if (paused) pausedAtMs else if (playing) player?.currentPosition ?: 0 else 0
+        if (paused) pausedAtMs
+        else if (cueHold) cueHoldAtMs          // v1.16: под репликой позиция заморожена — как пауза
+        else if (playing) player?.currentPosition ?: 0 else 0
     } catch (_: Exception) { 0 }
     fun durationMs(): Int = try { val d = player?.duration ?: 0; if (d > 0) d else 0 } catch (_: Exception) { 0 }
     // v0.36 (аудит): в паузе перемотка обязана двигать ЗАМОРОЖЕННУЮ позицию (pausedAtMs) —
     // раньше resume делал seekTo(pausedAtMs) и отбрасывал всё, что юзер намотал в паузе.
+    // v1.16: аналогично для cueHold — реплика держит позицию, и releaseCueHold делает seekTo(cueHoldAtMs);
+    // если юзер в этот момент перемотал, НОВАЯ позиция должна уехать в cueHoldAtMs, иначе релиз затрёт перемотку.
     fun seekToMs(ms: Int) {
         val target = ms.coerceAtLeast(0)
         if (paused) pausedAtMs = target
+        if (cueHold) cueHoldAtMs = target
         try { player?.seekTo(target) } catch (_: Exception) {}
     }
     fun nudgeMs(delta: Int) {
         try {
             val p = player ?: return
             val d = p.duration
-            val base = if (paused) pausedAtMs else p.currentPosition
+            val base = if (paused) pausedAtMs
+                        else if (cueHold) cueHoldAtMs   // v1.16: под репликой позиция заморожена
+                        else p.currentPosition
             val target = (base + delta).coerceIn(0, if (d > 0) d else Int.MAX_VALUE)
             if (paused) pausedAtMs = target
+            if (cueHold) cueHoldAtMs = target
             p.seekTo(target)
         } catch (_: Exception) {}
     }
@@ -2167,7 +2272,7 @@ class BridgeService : Service() {
             playQueue.addLast(JSONObject().put("type", "voice").put("audio", ap)
                 .put("session", sid).put("proj", proj).put("ts", ts))
         }
-        LogBus.add("играю выбранное из «$proj»: ${items.size} ч.")
+        LogBus.add(tr("играю выбранное из «$proj»: ${items.size} ч.", "playing the selection from “$proj”: ${items.size} parts"))
         kickPlayback()
     }
 
@@ -2202,20 +2307,20 @@ class BridgeService : Service() {
     private fun beginSend() {
         awaitSendCueUntil = System.currentTimeMillis() + 4000   // v1.08: «ушло» звучит первым
         if (Cfg.whisper) {
-            if (recThread != null) { LogBus.add("кнопка — отправляю"); finalizeReq = true; return }
+            if (recThread != null) { LogBus.add(tr("кнопка — отправляю", "button — sending")); finalizeReq = true; return }
             if (playbackBusy()) {
-                LogBus.add("жму отправить, а рация ещё говорит — прерываю ответ и поднимаю микрофон")
+                LogBus.add(tr("жму отправить, а рация ещё говорит — прерываю ответ и поднимаю микрофон", "pressing send while the radio is still speaking — interrupting the reply and raising the microphone"))
                 stopPlayback(thenListen = true)
                 return
             }
-            LogBus.add("нечего отправлять — микрофон не пишет")
-            cue("ничего не расслышал")
+            LogBus.add(tr("нечего отправлять — микрофон не пишет", "nothing to send — microphone is not recording"))
+            cue(tr("ничего не расслышал", "didn't catch anything"))
             return
         }
         // тот же случай на пути Android-распознавателя: черновика нет, потому что микрофон
         // не работал — до v0.48 через 2с приходило «ничего не расслышал» из finishPendingSend
         if (draft.isEmpty() && lastPartial.isEmpty() && playbackBusy()) {
-            LogBus.add("жму отправить, а рация ещё говорит — прерываю ответ и поднимаю микрофон")
+            LogBus.add(tr("жму отправить, а рация ещё говорит — прерываю ответ и поднимаю микрофон", "pressing send while the radio is still speaking — interrupting the reply and raising the microphone"))
             stopPlayback(thenListen = true)
             return
         }
@@ -2242,8 +2347,8 @@ class BridgeService : Service() {
         if (text.isNotEmpty()) sleepAfterSend() else if (!Cfg.handsFree) stopListening()
         else if (listening) startRecognizerCycle()
         if (text.isNotEmpty()) send(text) else {
-            LogBus.add("пустой черновик — не отправляю")
-            cue("ничего не расслышал")   // v0.30: иначе нажатие выглядит как поломка
+            LogBus.add(tr("пустой черновик — не отправляю", "empty draft — not sending"))
+            cue(tr("ничего не расслышал", "didn't catch anything"))   // v0.30: иначе нажатие выглядит как поломка
             buzz(300)
         }
     }
@@ -2258,14 +2363,61 @@ class BridgeService : Service() {
         }
     }
 
+    // v1.16-fix: когда телефон закрыл utt — подтверждение сообщения, закрытого ДО ручного
+    // выбора, этот выбор не снимает (ревью: старый ACK в X стирал новый выбор X)
+    private val uttClosedAt = HashMap<String, Long>()
+
+    // v1.41 (боевое, v1.40: «диктую длинный ответ во фриланс — посреди речи „ушло, дальше
+    // voice bridge“, и заиграл чужой ответ»). Потолок (90с записи / 45с удержания) закрывал utt
+    // финалом, сервер честно отвечал utt_sent, а тот говорил «ушло … дальше X» и пинал очередь.
+    // Пока звучала фраза, рекордер глух (эхо-гейт), датчик речи протухал, uttSpeechMs обнулён
+    // newUtt — придержка отпускала, и playNext гасил микрофон посреди мысли. Теперь дорезанное
+    // потолком — ЧАСТЬ: уходит тому же адресату молча, очередь не трогаем, микрофон живёт.
+    // «Ушло» прозвучит один раз — на настоящем конце диктовки (слово, кнопка, тишина).
+    // Монолог = диктовка, опознаётся по listenStartedAt её подъёма микрофона. Каждый финал рекордер
+    // метит своей диктовкой (uttDict), части — ещё и capPartUtts. ACK части ВСЕГДА молчит: живая
+    // диктовка — чтобы не глушить рекордер; запоздалый — чтобы не было второго «ушло» после финала
+    // или фразы посреди уже следующей диктовки (ревью v1.41).
+    // Учёт по монологам, не одним слотом: ACK разных диктовок приходят вперемешку (ревью v1.41).
+    private val uttDict = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val capPartUtts = java.util.concurrent.ConcurrentHashMap<String, Long>()   // часть → монолог
+    @Volatile private var capPartAt = 0L          // когда потолок дорезал часть (рекордер)
+    private val partDebt = HashMap<Long, String>()      // монолог → адресат: части доехали молча, «ушло» за нами
+    private val confirmedDicts = HashSet<Long>()        // монологи, чьё подтверждение уже прозвучало
+    private val endedOwingDicts = HashSet<Long>()       // финал пришёл раньше ACK частей — подтвердит их ACK
+    private fun partsInFlight(dict: Long) = capPartUtts.values.contains(dict)
+    private fun markConfirmed(dict: Long) {
+        if (confirmedDicts.size > 20) confirmedDicts.clear()
+        confirmedDicts.add(dict); partDebt.remove(dict); endedOwingDicts.remove(dict)
+    }
+    // диктовка события: метка рекордера; utt, закрытый сервером без финала телефона, — по времени
+    // старта (uttId = base36 времени): начат после подъёма микрофона — значит, этой диктовки
+    private fun dictOf(utt: String): Long = uttDict.remove(utt)
+        ?: if ((utt.toLongOrNull(36) ?: 0L) >= listenStartedAt) listenStartedAt else -1L
+    // долг «ушло» гасит только финал ТОГО ЖЕ монолога; чужой (запоздалый) его не трогает
+    private fun takePartDebt(dict: Long): String {
+        val sid = partDebt[dict] ?: return ""
+        markConfirmed(dict)
+        return sid
+    }
+    // монолог кончился пустым/отменённым хвостом, а его части ещё не подтверждены сервером
+    private fun noteEndedOwing(dict: Long) {
+        if (!partsInFlight(dict)) return
+        if (endedOwingDicts.size > 20) endedOwingDicts.clear()
+        endedOwingDicts.add(dict)
+        LogBus.add(tr("части монолога ещё в пути — подтвержу, когда доедут", "monologue parts still in transit — will confirm when they arrive"))
+    }
+
     private fun armUttAckTimer(utt: String) {
+        if (uttClosedAt.size > 20) uttClosedAt.clear()
+        uttClosedAt[utt] = System.currentTimeMillis()
         pendingUttAck = utt
         uttAckTimer?.let { main.removeCallbacks(it) }
         val t = Runnable {
             if (alive && pendingUttAck == utt) {
                 pendingUttAck = ""
-                LogBus.add("сервер не подтвердил распознавание за 25с — сообщение могло застрять")
-                cue("распознавание молчит")
+                LogBus.add(tr("сервер не подтвердил распознавание за 25с — сообщение могло застрять", "server did not confirm recognition within 25s — the message may be stuck"))
+                cue(tr("распознавание молчит", "recognition is silent"))
                 buzz(400)
             }
         }
@@ -2281,7 +2433,7 @@ class BridgeService : Service() {
         // ненастроенного новичка ронял бы сервис. Сохранение настроек перезапускает
         // сервис (v0.36), так что после настройки connect() честно повторится.
         if (Cfg.url.isBlank() || Cfg.token.isBlank()) {
-            LogBus.add("релей не настроен — открой настройки и вставь конфиг")
+            LogBus.add(tr("релей не настроен — открой настройки и вставь конфиг", "relay not configured — open settings and paste the config"))
             return
         }
         val wsUrl = Cfg.url.replaceFirst("https", "wss") +
@@ -2294,13 +2446,13 @@ class BridgeService : Service() {
                     val wasDown = !wsUp
                     wsUp = true
                     reconnectDelay = 3000L
-                    LogBus.add("связь с релеем установлена")
+                    LogBus.add(tr("связь с релеем установлена", "relay connection established"))
                     // v0.26: голосом — только на СМЕНУ состояния, иначе реконнекты засыплют репликами
-                    if (wasDown && announcedLink != true) { announcedLink = true; cue("рация на связи"); buzz(60) }
+                    if (wasDown && announcedLink != true) { announcedLink = true; cue(tr("рация на связи", "radio online")); buzz(60) }
                     // v0.36: досылаем то, что не ушло из-за сети (send() больше не теряет текст)
                     while (unsent.isNotEmpty()) {
                         val t = unsent.pollFirst() ?: break
-                        LogBus.add("досылаю сохранённое: ${t.take(50)}")
+                        LogBus.add(tr("досылаю сохранённое: ${t.take(50)}", "resending saved: ${t.take(50)}"))
                         send(t, attempt = 1)
                     }
                 }
@@ -2317,8 +2469,8 @@ class BridgeService : Service() {
                 main.post {
                     if (!alive || webSocket !== ws) return@post
                     wsUp = false
-                    LogBus.add("связь потеряна: ${t.message} — переподключусь")
-                    if (announcedLink != false) { announcedLink = false; cue("связь потеряна"); buzz(500) }
+                    LogBus.add(tr("связь потеряна: ${t.message} — переподключусь", "connection lost: ${t.message} — will reconnect"))
+                    if (announcedLink != false) { announcedLink = false; cue(tr("связь потеряна", "connection lost")); buzz(500) }
                     scheduleReconnect()
                 }
             }
@@ -2343,7 +2495,7 @@ class BridgeService : Service() {
         val o = try { JSONObject(text) } catch (e: Exception) { return }
         when (o.optString("type")) {
             "hello" -> {
-                LogBus.add("релей на связи")
+                LogBus.add(tr("релей на связи", "relay is online"))
                 // catch up on missed messages: never older than 30 min, dedup by ts
                 if (!Cfg.catchup) return
                 val recent = o.optJSONArray("recent") ?: return
@@ -2369,24 +2521,44 @@ class BridgeService : Service() {
                     added++
                 }
                 if (added > 0) {
-                    LogBus.add("накопилось $added част. — микрофон свободен, говори; «слушать» проиграет их")
+                    LogBus.add(tr("накопилось $added част. — микрофон свободен, говори; «слушать» проиграет их", "$added parts piled up — microphone is free, speak; “listen” will play them"))
                     // v0.68: раньше о догнанных ответах говорил только вибро-толчок — на ходу
                     // это «рация буркнула и молчит». Теперь называем вслух, что делать.
-                    say("есть ответы — нажми слушать")
+                    say(tr("есть ответы — нажми слушать", "replies waiting — press listen"))
                     buzz(140)               // толчок: есть что послушать
                     // v0.94: cue("есть ответы") УДАЛЁН — он обрывал фразу выше на полуслове,
                     // а говорил ровно то же, только без подсказки, что делать (аудит)
                     updateNotification()
                 } else if (recent.length() > 0) {
-                    LogBus.add("догонять нечего")
+                    LogBus.add(tr("догонять нечего", "nothing to catch up on"))
                 }
             }
             // v0.35: сервер распознал и отправил надиктованное — подтверждаем юзеру
             "utt_sent" -> {
                 clearUttAck(o.optString("utt"))
-                LogBus.add("отправлено (whisper): " + o.optString("text").take(60))
+                // v1.41: часть монолога (дорезал потолок), а диктовка ещё открыта — молча.
+                // Микрофон уже спит — диктовка кончилась, тогда это обычное «ушло».
+                val part = capPartUtts.remove(o.optString("utt")) != null
+                // v1.42: речь, которую сервер переселил в «<utt>r» после своего финала, — «ушло»
+                // по монологу уже прозвучало. Такой id ещё и разбирается как base36 (×36), так
+                // что ни штамп, ни диктовку из него брать нельзя
+                val tail = o.optBoolean("orphan")
+                val dict = dictOf(o.optString("utt"))
+                val partLive = part && listening && dict == listenStartedAt
+                LogBus.add((if (partLive) tr("часть монолога доехала (потолок), диктовка продолжается: ", "part of the monologue arrived (cap), dictation continues: ")
+                    else if (part) tr("запоздалая часть монолога доехала: ", "late part of the monologue arrived: ") else tr("отправлено (whisper): ", "sent (whisper): ")) +
+                    o.optString("text").take(60))
                 answeredCurrent = true   // v0.81: ответ дан — зазор больше не приглашает
-                manualPinTs = 0L         // v0.85: ручной выбор был НА ОДНО сообщение — оно ушло
+                // v0.85: ручной выбор был НА ОДНО сообщение — оно ушло. v1.16-fix: только если
+                // ушло В ВЫБРАННЫЙ канал и закрыто ПОСЛЕ выбора: запоздалое подтверждение
+                // прошлого сообщения не должно стирать выбор, сделанный уже после него.
+                // utt закрыл сервер — момента закрытия нет; тогда берём момент НАЧАЛА диктовки
+                // (uttId = время старта в base36): начатое после выбора — это и есть то одно сообщение
+                val closedAt = uttClosedAt.remove(o.optString("utt"))
+                    ?: o.optString("utt").toLongOrNull(36) ?: 0L
+                // v1.41: часть — сообщение ещё не кончилось, выбор живёт до его конца
+                // v1.42 (ревью): хвост — продолжение уже ушедшего; выбор, сделанный после, не трогаем
+                if (!part && !tail && o.optString("session") == Cfg.replyTarget && closedAt >= manualPinTs) manualPinTs = 0L
                 lastSendOkTs = System.currentTimeMillis()   // v0.90
                 awaitSendCueUntil = 0L                          // v1.08: подтверждение получено
                 applyPendingTarget(o.optString("utt"))   // v0.78: начатое доехало старому — переключаемся
@@ -2398,7 +2570,7 @@ class BridgeService : Service() {
                     val deadSid = o.optString("session")
                     val who = SessionBook.all().firstOrNull { it.sid == deadSid }?.proj
                         ?: deadSid.take(8)
-                    LogBus.add("ВНИМАНИЕ: «$who» не забирает сообщения — та сессия закрыта или её приёмник умер. Текст ждёт в очереди")
+                    LogBus.add(tr("ВНИМАНИЕ: «$who» не забирает сообщения — та сессия закрыта или её приёмник умер. Текст ждёт в очереди", "WARNING: “$who” is not picking up messages — that session is closed or its receiver died. The text waits in the queue"))
                     // v0.41 (боевое «в какую бы сессию я не отвечал — не слушает»): виноват был
                     // ПРИКЛЕЕННЫЙ replyTarget на мёртвую сессию — все диктовки летели в неё,
                     // что бы юзер ни слушал. Мёртвый адресат отклеивается сам: следующие
@@ -2412,11 +2584,11 @@ class BridgeService : Service() {
                     if (deadSid.isNotEmpty() && deadSid == Cfg.replyTarget && !manualFresh) {
                         Cfg.replyTarget = ""
                         Cfg.save(this)
-                        LogBus.add("мёртвый адресат откреплён — отвечаю теперь в последнюю игравшую")
-                        cue("адресат сброшен, повтори")
+                        LogBus.add(tr("мёртвый адресат откреплён — отвечаю теперь в последнюю игравшую", "dead target unpinned — replying now to the last one that played"))
+                        cue(tr("адресат сброшен, повтори", "recipient reset, say it again"))
                     } else if (System.currentTimeMillis() - lastUnreadCueTs > 10000) {
                         lastUnreadCueTs = System.currentTimeMillis()
-                        cue("канал не слушает")
+                        cue(tr("канал не слушает", "channel is not listening"))
                         // v0.82: не добавлять «слушаю, X» поверх предупреждения (каша из фраз).
                         // Окно, а не флаг: подъём микрофона может случиться сильно позже, и тогда
                         // молчание было бы уже вредным («микрофон встал, а я не знаю»).
@@ -2433,7 +2605,20 @@ class BridgeService : Service() {
                 // отсчёт тишины там не доходит до конца НИКОГДА, значит финал почти всегда серверный).
                 // v0.51 (ревью): при unread НЕ спим — текст не дошёл, рация вслух просит
                 // повторить, и заснувший микрофон означал бы повтор в выключенный микрофон.
-                if (o.optString("utt") == uttId) {
+                // v1.41 (ревью): ACK части обогнал newUtt рекордера — не спать: рекордер сам
+                // откроет новый utt следующей строкой, монолог продолжается
+                // v1.42 (боевое 15.10: «хвост после отправки отброшен (3с речи)» дважды за две
+                // минуты): совпадение с uttId значит, что финал сделал СЕРВЕР, не телефон — тот
+                // ротирует utt сам в момент отправки. Причину пишем в журнал (стоп-слово каким
+                // словом). Причина боевого случая — обрубок «Отправляе» на обрезке сегмента по
+                // длине; её лечит сервер (метка cut), хвост по-прежнему отбрасывается.
+                if (!part && o.optString("utt") == uttId) {
+                    val why = o.optString("why")
+                    if (why.isNotEmpty()) LogBus.add(tr("сообщение закрыл сервер: ", "message closed by the server: ") + when (why) {
+                        "send-word" -> tr("стоп-слово «", "stop word «") + o.optString("word") + "»"
+                        "silence" -> tr("смысловая тишина", "semantic silence")
+                        else -> why
+                    })
                     if (listening && !o.optBoolean("unread")) sleepAfterSend() else rotateReq = true
                 }
                 // v0.52: реплика ПОСЛЕ решения о сне — одной фразой и куда ушло, и уснул ли микрофон.
@@ -2443,7 +2628,42 @@ class BridgeService : Service() {
                 // v0.73 (слово юзера: «служебная фраза поверх идущего ответа»): гейт смотрел
                 // только на ОЧЕРЕДЬ и молчал о том, что озвучка УЖЕ ИГРАЕТ — тогда «ушло,
                 // микрофон спит» ложилось поверх ответа. Играет — подтверждаем вибро.
-                if (!o.optBoolean("unread")) {
+                if (tail) {
+                    // v1.42: вторая фраза «ушло» на тот же монолог только путает; новая диктовка
+                    // могла уже начаться — вибро, не речь поверх
+                    if (!o.optBoolean("unread")) { LogBus.add(tr("хвост оборванного сообщения доехал", "tail of the cut-off message arrived")); buzz(180) }
+                    kickPlayback()
+                    return
+                }
+                if (part) {
+                    // v1.41: ни фразы (она глушит рекордер и отпускает придержку), ни пинка очереди
+                    // посреди речи. «Канал не слушает» выше остаётся: о мёртвом адресате молчать нельзя.
+                    // Долг «ушло» — если финал этого монолога ещё не подтверждён.
+                    if (!o.optBoolean("unread") && dict !in confirmedDicts) {
+                        if (dict in endedOwingDicts) {
+                            // хвост монолога уже закрыт пустым/отменой, а часть доехала только сейчас —
+                            // это и есть подтверждение. Идёт новая диктовка — вибро, не фраза поверх речи.
+                            markConfirmed(dict)
+                            LogBus.add(tr("запоздалая часть закрытого монолога доехала — подтверждаю", "late part of a closed monologue arrived — confirming"))
+                            if (!listening) cue(sentCuePhrase(o.optString("session")))
+                            buzz(180)
+                        } else partDebt[dict] = o.optString("session")
+                    }
+                    if (!partLive) kickPlayback()   // диктовка кончилась — держать очередь незачем
+                    return
+                }
+                // v1.41 (ревью): хвост ушёл в канал, который не слушает, — «канал не слушает» выше
+                // сказано про весь монолог; доехавшее начало отмечаем в журнале, долг гасим
+                if (o.optBoolean("unread") && takePartDebt(dict).isNotEmpty())
+                    LogBus.add(tr("начало монолога доехало, хвост ждёт в очереди канала", "start of the monologue arrived, tail waits in the channel queue"))
+                markConfirmed(dict)   // это «ушло» покрывает и молча доехавшие части своего монолога
+                // v1.41 (ревью): запоздалое «ушло» прошлого монолога, а юзер уже диктует новый —
+                // фраза заглушила бы рекордер посреди речи; подтверждаем вибро
+                val otherDictLive = listening && dict != listenStartedAt
+                if (!o.optBoolean("unread") && otherDictLive) {
+                    LogBus.add(tr("прошлое сообщение доехало — вибро, идёт новая диктовка", "previous message arrived — vibration, new dictation in progress"))
+                    buzz(180)
+                } else if (!o.optBoolean("unread")) {
                     val queuedNow = playQueue.isNotEmpty() || fileQueue.isNotEmpty()
                     // «звук реально слышен» = playing && !paused (пауза — это заглушение, v0.15)
                     val busy = playing && !paused
@@ -2467,7 +2687,11 @@ class BridgeService : Service() {
             }
             "utt_empty" -> {
                 clearUttAck(o.optString("utt"))
-                LogBus.add("whisper ничего не расслышал")
+                // v1.42 (review): a re-homed orphan id "<utt>r" parses as base36 into the CURRENT
+                // dictation in dictOf — its empty/cancel must not settle the live monologue's debt
+                // or speak over the user: vibrate only
+                if (o.optBoolean("orphan")) { LogBus.add(tr("хвост оборванного сообщения: %s", "tail of the cut-off message: %s").format(o.optString("type"))); buzz(180); kickPlayback(); return }
+                LogBus.add(tr("whisper ничего не расслышал", "whisper heard nothing"))
                 applyPendingTarget(o.optString("utt"))   // v0.78: закрывать было нечего — переключаемся
                 // v0.37: на фоновом шуме это событие может идти подряд — реплику не чаще раза в минуту
                 // v1.00 (боевое, повтор: «нажал отправить, положил телефон — и через 10 секунд
@@ -2480,18 +2704,80 @@ class BridgeService : Service() {
                 // удачной отправки микрофон больше не поднимали.
                 val justSent = (micAsleep || System.currentTimeMillis() - lastSendOkTs < 30000) &&
                     listenStartedAt <= lastSendOkTs
+                // v1.41: после молча доехавших частей пустым вышел только хвост («отправляй» без
+                // новых слов) — подтверждение всего монолога ещё не звучало, говорим его сейчас
+                // Пустая сама часть (потолок дорезал ветер), а диктовка открыта — молчим: фраза
+                // посреди речи глушит рекордер, ради чего всё и затевалось.
+                val emptyPart = capPartUtts.remove(o.optString("utt")) != null
+                val dict = dictOf(o.optString("utt"))
+                if (emptyPart) {
+                    LogBus.add(tr("часть монолога пуста (потолок дорезал шум) — молчу", "monologue part is empty (cap cut noise) — staying silent"))
+                    if (dict in endedOwingDicts && !partsInFlight(dict)) {
+                        // монолог закрыт, и ни одна его часть так и не доехала — честно сказать
+                        endedOwingDicts.remove(dict)
+                        if (!listening) cue(tr("ничего не расслышал", "didn't catch anything"))
+                    }
+                    if (!listening) kickPlayback()
+                    return
+                }
+                val owedSid = takePartDebt(dict)
+                if (owedSid.isNotEmpty()) {
+                    LogBus.add(tr("хвост пуст, но части монолога доехали — подтверждаю", "tail is empty, but the monologue parts arrived — confirming"))
+                    // сервер сам закрыл текущий utt (смысловая тишина) — это конец монолога, как
+                    // в utt_sent: спим; закрытый id не переиспользуем (v0.51)
+                    if (o.optString("utt") == uttId) {
+                        if (listening) sleepAfterSend() else rotateReq = true
+                    }
+                    // идёт уже другая диктовка — вибро, не фраза поверх речи
+                    if (!(listening && dict != listenStartedAt)) cue(sentCuePhrase(owedSid))
+                    buzz(180)
+                    kickPlayback()
+                    return
+                }
+                if (partsInFlight(dict)) {
+                    // пустой финал обогнал ACK частей: монолог кончен, подтвердит доехавшая часть
+                    noteEndedOwing(dict)
+                    if (o.optString("utt") == uttId) {
+                        if (listening) sleepAfterSend() else rotateReq = true
+                    }
+                    kickPlayback()
+                    return
+                }
                 if (System.currentTimeMillis() - lastEmptyCueTs > 60000 && (!playing || paused) && !justSent) {
                     lastEmptyCueTs = System.currentTimeMillis()
-                    cue("ничего не расслышал")   // v0.88/0.90: не поверх ответа и не сразу после «ушло»
-                } else if (justSent) LogBus.add("пустой хвост после отправки — молчу")
+                    cue(tr("ничего не расслышал", "didn't catch anything"))   // v0.88/0.90: не поверх ответа и не сразу после «ушло»
+                } else if (justSent) LogBus.add(tr("пустой хвост после отправки — молчу", "empty tail after sending — staying quiet"))
                 buzz(300)
             }
             // v0.36: голосовая «отмена» теперь работает и в whisper-режиме — её ловит сервер
             "utt_cancelled" -> {
                 clearUttAck(o.optString("utt"))
-                LogBus.add("отмена по голосу (whisper) — черновик стёрт")
+                // v1.42 (review): a re-homed orphan id "<utt>r" parses as base36 into the CURRENT
+                // dictation in dictOf — its empty/cancel must not settle the live monologue's debt
+                // or speak over the user: vibrate only
+                if (o.optBoolean("orphan")) { LogBus.add(tr("хвост оборванного сообщения: %s", "tail of the cut-off message: %s").format(o.optString("type"))); buzz(180); kickPlayback(); return }
+                val cancelPart = capPartUtts.remove(o.optString("utt")) != null
+                val dict = dictOf(o.optString("utt"))
+                LogBus.add(tr("отмена по голосу (whisper) — черновик стёрт", "voice cancel (whisper) — draft erased"))
+                // v1.41 (ревью): «отмена» попала в кусок, дорезанный потолком, а диктовка идёт.
+                // Монолог не кончен: долг «ушло» за прежние части остаётся до финала, очередь
+                // держим. Но стёртый кусок — до 90с речи, молчать о потере нельзя: одна фраза,
+                // придержка ответа продлена на неё (capPartAt), адресат не трогаем.
+                if (cancelPart && listening && dict == listenStartedAt) {
+                    LogBus.add(tr("отменён кусок монолога (потолок), диктовка продолжается", "monologue chunk (cap) cancelled, dictation continues"))
+                    capPartAt = System.currentTimeMillis()
+                    cue(tr("кусок отменён, слушаю", "chunk cancelled, listening"))
+                    buzz(220)
+                    return
+                }
                 applyPendingTarget(o.optString("utt"))   // v0.78: иначе смена висела бы до страховки
-                cue("отменено")
+                // v1.41: дорезанные потолком части уже доехали — «отменено» про них было бы враньём
+                val partsGone = takePartDebt(dict).isNotEmpty()
+                if (!partsGone) noteEndedOwing(dict)
+                if (partsGone) LogBus.add(tr("отменён только хвост — начало монолога уже доехало", "only the tail cancelled — the start of the monologue already arrived"))
+                // v1.41 (ревью): запоздалая отмена прошлого монолога посреди новой диктовки — вибро
+                if (listening && dict != listenStartedAt) LogBus.add(tr("прошлое сообщение отменено — вибро, идёт новая диктовка", "previous message cancelled — vibration, new dictation in progress"))
+                else cue(if (partsGone) tr("начало ушло, хвост отменён", "start sent, tail cancelled") else tr("отменено", "cancelled"))
                 buzz(220)
                 if (o.optString("utt") == uttId) rotateReq = true
                 kickPlayback()
@@ -2501,6 +2787,7 @@ class BridgeService : Service() {
             // Текст команды в сессию НЕ уходил — отвечаем на неё сами.
             "utt_cmd" -> {
                 clearUttAck(o.optString("utt"))
+                capPartUtts.remove(o.optString("utt")); uttDict.remove(o.optString("utt"))   // v1.41: не копим метки
                 // команда закрыла utt на сервере — следующая мысль обязана уехать в НОВЫЙ,
                 // иначе сервер выбросит её как хвост завершённого (done-ring transcribe.js)
                 if (o.optString("utt") == uttId) rotateReq = true
@@ -2508,7 +2795,7 @@ class BridgeService : Service() {
                 val src = c?.optString("src") ?: ""
                 // v0.55 (ревью): в журнале видно, ЧТО именно было съедено командой — если
                 // сработало ложно, текст не придётся вспоминать по памяти
-                if (src.isNotEmpty()) LogBus.add("команда рации из: «$src»")
+                if (src.isNotEmpty()) LogBus.add(tr("команда рации из: «$src»", "radio command from: “$src”"))
                 buzz(140)   // толчок: команда принята, даже если реплики выключены
                 when (c?.optString("cmd")) {
                     "list" -> speakSessionList()
@@ -2526,8 +2813,8 @@ class BridgeService : Service() {
                         pendingSend = false
                         cancelAutoSend()
                         if (Cfg.whisper && recThread != null) cancelReq = true
-                        LogBus.add(if (hadDraft) "отбой: черновик стёрт, микрофон спит" else "отбой: микрофон спит")
-                        cue(if (hadDraft) "отбой, стёрто" else "отбой")
+                        LogBus.add(if (hadDraft) tr("отбой: черновик стёрт, микрофон спит", "cancel: draft erased, microphone asleep") else tr("отбой: микрофон спит", "cancel: microphone asleep"))
+                        cue(if (hadDraft) tr("отбой, стёрто", "discarded, erased") else tr("отбой", "discarded"))
                         buzz(220)
                         noAutoWakeUntil = System.currentTimeMillis() + 600000   // 10 минут тишины
                         main.postDelayed({ if (alive) sleepAfterSend() }, 300)
@@ -2542,12 +2829,12 @@ class BridgeService : Service() {
                         Cfg.save(this)
                         lastAnnouncedTarget = null
                         LogBus.add(
-                            if (wasSolo) "рубка: закрепление и режим «только одна» сняты — слушаю всех"
-                            else "рубка: закрепление снято — отвечаю в последнюю игравшую"
+                            if (wasSolo) tr("рубка: закрепление и режим «только одна» сняты — слушаю всех", "switchboard: pin and “only one” mode cleared — listening to everyone")
+                            else tr("рубка: закрепление снято — отвечаю в последнюю игравшую", "switchboard: pin cleared — replying to the last one that played")
                         )
-                        say(if (wasSolo) "слушаю все сессии" else "отвечаю в последнюю игравшую")
+                        say(if (wasSolo) tr("слушаю все сессии", "listening to all sessions") else tr("отвечаю в последнюю игравшую", "replying to the last one that played"))
                     }
-                    else -> LogBus.add("команда рации не разобрана")
+                    else -> LogBus.add(tr("команда рации не разобрана", "radio command not parsed"))
                 }
                 kickPlayback()
             }
@@ -2557,11 +2844,12 @@ class BridgeService : Service() {
             "utt_warn" -> {
                 beepBoth(ToneGenerator.TONE_PROP_BEEP, 90)
                 buzz(140)
-                LogBus.add("сервер не слышит слов 12с — если не закончил, говори дальше")
+                LogBus.add(tr("сервер не слышит слов 12с — если не закончил, говори дальше", "server hears no words for 12s — if you are not done, keep talking"))
             }
             "utt_lost" -> {
                 clearUttAck(o.optString("utt"))
-                LogBus.add("сообщение НЕ доставлено: релей не знает сессию-адресата")
+                capPartUtts.remove(o.optString("utt")); uttDict.remove(o.optString("utt"))   // v1.41: не копим метки
+                LogBus.add(tr("сообщение НЕ доставлено: релей не знает сессию-адресата", "message NOT delivered: relay does not know the target session"))
                 applyPendingTarget(o.optString("utt"))
                 beepBoth(ToneGenerator.TONE_PROP_NACK, 300)
                 buzz(400)
@@ -2575,18 +2863,24 @@ class BridgeService : Service() {
                 // v0.73: юзер выбросил это сообщение в разборе накопленного — его хвост
                 // (части приходят с разрывом до минуты) играть нельзя, он его отменил
                 if (skippedMsgIds.contains(sid + "|" + o.optString("msgid"))) {
-                    LogBus.add("хвост пропущенного сообщения «${o.optString("proj")}» — не играю")
+                    LogBus.add(tr("хвост пропущенного сообщения «${o.optString("proj")}» — не играю", "tail of a missed message “${o.optString("proj")}” — not playing"))
+                    return
+                }
+                if (Cfg.voiceOff) {
+                    // v1.28: ответ уже в ленте; отметить как увиденный, чтобы догон не поднял его
+                    lastEventTs = maxOf(lastEventTs, o.optLong("ts"))
+                    LogBus.add(tr("«${o.optString("proj")}» ответил — голос выключен, только лента", "“${o.optString("proj")}” replied — voice off, feed only"))
                     return
                 }
                 if (!audible(sid)) {
                     LogBus.add(
-                        if (Cfg.pickedSids.isNotEmpty()) "«${o.optString("proj")}» молчит: работаю с «${pickedNames()}»"
-                        else "«${o.optString("proj")}» замьючен — пропускаю"
+                        if (Cfg.pickedSids.isNotEmpty()) tr("«${o.optString("proj")}» молчит: работаю с «${pickedNames()}»", "“${o.optString("proj")}” is silent: working with “${pickedNames()}”")
+                        else tr("«${o.optString("proj")}» замьючен — пропускаю", "“${o.optString("proj")}” is muted — skipping")
                     )
                     return
                 }
                 playQueue.addLast(o)
-                LogBus.add("голос из «${o.optString("proj")}» (${o.optInt("part")}/${o.optInt("parts")})")
+                LogBus.add(tr("голос из «${o.optString("proj")}» (${o.optInt("part")}/${o.optInt("parts")})", "voice from “${o.optString("proj")}” (${o.optInt("part")}/${o.optInt("parts")})"))
                 kickPlayback()
             }
         }
@@ -2607,6 +2901,7 @@ class BridgeService : Service() {
     // v0.57: зазор на границе ответов разных сессий — см. playNext
     private var boundarySid: String? = null
     private var boundaryHoldUntil = 0L
+    private val BOUNDARY_ANSWER_MS = 12000L   // окно на ответ в зазоре между каналами
     private val cueQueue = ArrayDeque<File>()   // v0.94: реплики договаривают по очереди
     // v1.15 (слово юзера: «системная фраза и голос ответа звучат одновременно»; и раньше:
     // «приглушения быть не должно — как будто отдали управление: сначала системное, потом
@@ -2639,7 +2934,7 @@ class BridgeService : Service() {
     private var cueWaitSince = 0L
 
     private fun kickPlayback() {
-        if (playing) return
+        if (playing || Cfg.voiceOff) return   // v1.28: вторая линия — без голоса не играет ничего
         // v0.53 (слово юзера, найдено им в поле: «включается два голоса разом — что ушло и что
         // микрофон спит, и поверх сразу озвучка ждавшего ответа»). Реплики играет cuePlayer, ответы —
         // player; это независимые источники, и на стыках они накладывались. Внешний вход в
@@ -2696,13 +2991,16 @@ class BridgeService : Service() {
             System.currentTimeMillis() - userActionTs < 12000
         val speakingNow = draft.isNotEmpty() || justRaisedByHand ||
             (Cfg.whisper && recThread != null && uttSpeechMs >= 600) ||
+            // v1.41: потолок только что дорезал часть — newUtt обнулил uttSpeechMs, но человек
+            // посреди мысли; окно короткое, дальше живость держат датчики ниже
+            (Cfg.whisper && recThread != null && System.currentTimeMillis() - capPartAt < 6000) ||
             System.currentTimeMillis() - lastActivityTs < 4000 ||
             System.currentTimeMillis() - lastLoudTs < 4000
         if (!playing && listening && batch.isEmpty() && speakingNow) {
             val now = System.currentTimeMillis()
             if (holdSince == 0L) {
                 holdSince = now
-                LogBus.add("ответ подожду — ты диктуешь")
+                LogBus.add(tr("ответ подожду — ты диктуешь", "will wait with the reply — you are dictating"))
                 buzz(140)   // v0.26: толчок = «ответ пришёл и ждёт, пока ты договоришь»
             }
             // v0.46: признак живости стал чутче — придержка теперь РЕАЛЬНО доживает до потолка
@@ -2751,7 +3049,7 @@ class BridgeService : Service() {
                 val now = System.currentTimeMillis()
                 if (partWaitDeadline == 0L) {
                     partWaitDeadline = now + 60000
-                    LogBus.add("сообщение не докачано ($lastPartNum/$lastPartsTotal) — жду следующую часть")
+                    LogBus.add(tr("сообщение не докачано ($lastPartNum/$lastPartsTotal) — жду следующую часть", "message incomplete ($lastPartNum/$lastPartsTotal) — waiting for the next part"))
                 }
                 if (now < partWaitDeadline) {
                     playing = false
@@ -2760,7 +3058,7 @@ class BridgeService : Service() {
                     main.postDelayed({ if (alive && !playing) kickPlayback() }, 1000)
                     return
                 }
-                LogBus.add("часть ${lastPartNum + 1}/$lastPartsTotal так и не пришла — считаю сообщение конченым")
+                LogBus.add(tr("часть ${lastPartNum + 1}/$lastPartsTotal так и не пришла — считаю сообщение конченым", "part ${lastPartNum + 1}/$lastPartsTotal never arrived — treating the message as finished"))
                 partWaitDeadline = 0L
                 lastPartsTotal = lastPartNum
             }
@@ -2781,7 +3079,7 @@ class BridgeService : Service() {
         if (holdForHeadset()) {
             playing = false
             abandonFocus()
-            LogBus.add("жду наушники (${playQueue.size} в очереди)")
+            LogBus.add(tr("жду наушники (${playQueue.size} в очереди)", "waiting for headphones (${playQueue.size} in queue)"))
             return
         }
 
@@ -2827,7 +3125,7 @@ class BridgeService : Service() {
             val now = System.currentTimeMillis()
             if (boundarySid != nextSid) {
                 boundarySid = nextSid
-                boundaryHoldUntil = now + 12000
+                boundaryHoldUntil = now + BOUNDARY_ANSWER_MS
                 // предыдущее сообщение закрыто: иначе его части держали бы приоритет и
                 // состояние тянулось бы в следующий канал
                 if (batch.isNotEmpty()) { lastBatch = batch.toList(); batch = mutableListOf() }
@@ -2843,21 +3141,23 @@ class BridgeService : Service() {
                 // посреди utt увезла бы уже сказанное в чужую сессию (ревью v0.76).
                 val spoke = lastSession
                 if (spoke != null && audible(spoke) && Cfg.replyTarget.isNotEmpty() &&
-                    Cfg.replyTarget != spoke && !speechInFlight() &&
-                    System.currentTimeMillis() - manualPinTs > 180000
+                    Cfg.replyTarget != spoke && !speechInFlight() && !manualPinHolds()
                 ) {
                     Cfg.replyTarget = ""
                     Cfg.save(this)
                     lastAnnouncedTarget = null
                     ensureTargetCues()
-                    LogBus.add("зазор: открепляю адресата — отвечаю тому, кто договорил («${lastSpokenName()}»)")
+                    LogBus.add(tr("зазор: открепляю адресата — отвечаю тому, кто договорил («${lastSpokenName()}»)", "gap: unpinning target — replying to whoever finished speaking (“${lastSpokenName()}”)"))
                 }
                 val who = o.optString("proj").ifEmpty { nextSid.take(4) }
-                val prev = lastSpokenName()   // кто ДОГОВОРИЛ, а не закреплённый адресат
-                LogBus.add("граница каналов: 12с на ответ «$prev» — дальше «$who» (заговоришь — подожду)")
+                // кто ДОГОВОРИЛ, а не закреплённый адресат. v1.16-fix: кроме ручного выбора —
+                // ответ уйдёт в выбранный, и звать «ответь договорившему» было бы враньём
+                val prev = if (Cfg.replyTarget.isNotEmpty() && Cfg.replyTarget != spoke && manualPinHolds())
+                    replyTargetName() else lastSpokenName()
+                LogBus.add(tr("граница каналов: ${BOUNDARY_ANSWER_MS / 1000}с на ответ «$prev» — дальше «$who» (заговоришь — подожду)", "channel boundary: ${BOUNDARY_ANSWER_MS / 1000}s to answer “$prev” — then “$who” (speak and I will wait)"))
                 // v0.81 (боевое: «говорит „ответил войсбридж“, хотя никто не отвечал»):
                 // «ответил X» читалось как «X прислал ответ». Фраза теперь — приглашение.
-                say("ответь " + spoken(prev) + ", дальше " + spoken(who))
+                say(tr("ответь ", "reply to ") + spoken(prev) + tr(", дальше ", ", next, ") + spoken(who))
                 // v0.88 (боевое: «ответь мета судья… слушаю мета судья» — две фразы об одном
                 // и том же подряд): объявление зазора УЖЕ назвало адресата, реплика подъёма
                 // микрофона тут лишняя. Окно с запасом на устаканивание SCO.
@@ -2884,6 +3184,9 @@ class BridgeService : Service() {
         answeredCurrent = false   // играет новое сообщение — ответа на него ещё не было
         playing = true
         stopListening() // half-duplex: never transcribe our own playback
+        // новое сообщение (не очередная часть того же) — заговорил новый «последний говоривший»
+        if (o.optString("session") != lastSession || o.optInt("part", 1) <= 1)
+            speakerStartTs = System.currentTimeMillis()
         lastSession = o.optString("session")
         currentSid = lastSession
         lastPartNum = o.optInt("part", 1)          // v0.42: знаем, докачано ли сообщение
@@ -2938,7 +3241,7 @@ class BridgeService : Service() {
                     if (++attempt >= 2) {
                         main.post {
                             if (!alive) return@post
-                            LogBus.add("ошибка загрузки звука: ${e.message}")
+                            LogBus.add(tr("ошибка загрузки звука: ${e.message}", "audio load error: ${e.message}"))
                             if (gen == playGen) playNext()
                         }
                         return@Thread
@@ -2969,12 +3272,14 @@ class BridgeService : Service() {
 
     private fun speakThenPlay(proj: String, f: File, gen: Int = playGen) {
         var played = false
+        val myAnnounceId = "announce_" + announceSeq.incrementAndGet()
         val proceed = Runnable {
-            if (!played && alive) { played = true; announceProceed = null; playFile(f, gen = gen) }
+            if (!played && alive) { played = true; announceProceed = null; announceId = null; playFile(f, gen = gen) }
         }
         try {
             requestFocus()
             announceProceed = proceed   // v0.37: продолжение зовёт единый TTS-слушатель
+            announceId = myAnnounceId
             tts?.setSpeechRate(Cfg.speed)
             // spoken(): имя канала теперь звучит на каждое сообщение — слаг с подчёркиваниями
             // читать вслух нельзя (v0.76)
@@ -2986,12 +3291,14 @@ class BridgeService : Service() {
                 override fun run() {
                     if (!alive) return
                     val cueBusy = cuePlayer != null || cueQueue.isNotEmpty() ||
-                        cuePlayWhenReady.isNotEmpty() || System.currentTimeMillis() < cuePendingUntil
+                        cuePlayWhenReady.isNotEmpty() || System.currentTimeMillis() < cuePendingUntil ||
+                        pendingSynth.get() > 0
                     if (cueBusy && System.currentTimeMillis() - since < 4000) {
                         main.postDelayed(this, 250)
                         return
                     }
-                    try { tts?.speak(spoken(proj), TextToSpeech.QUEUE_FLUSH, null, "announce") }
+                    val mode = if (pendingSynth.get() > 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+                    try { tts?.speak(spoken(proj), mode, null, myAnnounceId) }
                     catch (_: Exception) { main.post(proceed) }
                 }
             }
@@ -3072,7 +3379,7 @@ class BridgeService : Service() {
                     }
                 }
                 setOnErrorListener { _, w, e ->
-                    LogBus.add("ошибка плеера $w/$e")
+                    LogBus.add(tr("ошибка плеера $w/$e", "player error $w/$e"))
                     main.post {
                         if (alive) { currentFile = null; playNext() }
                     }
@@ -3094,14 +3401,14 @@ class BridgeService : Service() {
                 }
                 fadeIn(this)
                 // v0.10 диагностика обрывов: видно, сколько раз стартовал плеер и что осталось
-                LogBus.add("играю часть (в очереди ещё ${playQueue.size + fileQueue.size})")
+                LogBus.add(tr("играю часть (в очереди ещё ${playQueue.size + fileQueue.size})", "playing part (${playQueue.size + fileQueue.size} more in queue)"))
                 if (Cfg.speed != 1.0f) {
                     try { playbackParams = playbackParams.setSpeed(Cfg.speed) } catch (_: Exception) {}
                 }
             }
             updateNotification()
         } catch (e: Exception) {
-            LogBus.add("плеер не стартовал: ${e.message}")
+            LogBus.add(tr("плеер не стартовал: ${e.message}", "player did not start: ${e.message}"))
             currentFile = null
             main.post { if (alive) playNext() }
         }
@@ -3143,7 +3450,7 @@ class BridgeService : Service() {
         try {
             tts = TextToSpeech(this) { status ->
                 if (status == TextToSpeech.SUCCESS) {
-                    val r = tts?.setLanguage(Locale("ru", "RU"))
+                    val r = tts?.setLanguage(Lang.ttsLocale)
                     ttsReady = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
                     // v0.37: ЕДИНЫЙ слушатель прогресса TTS — эхо-гейт рекордера (ttsSpeaking)
                     // и продолжение после объявления проекта (announceProceed). Раньше
@@ -3161,21 +3468,36 @@ class BridgeService : Service() {
                         // НАВСЕГДА — «слушаю, бра…» переживало бы перезапуски. Чистим огрызок.
                         override fun onStop(utteranceId: String?, interrupted: Boolean) {
                             if (utteranceId?.startsWith("cuefile_") == true) {
+                                pendingSynth.decrementAndGet()
                                 val p = utteranceId.removePrefix("cuefile_")
-                                cuePlayWhenReady.remove(p)
                                 cueFiles.remove(p)?.let { try { it.delete() } catch (_: Exception) {} }
+                                if (cuePlayWhenReady.contains(p) && cueResynthOnce.add(p)) {
+                                    main.post {
+                                        if (!(alive && cuePlayWhenReady.contains(p) && ensureCue(p))) {
+                                            cueResynthOnce.remove(p)
+                                            cuePlayWhenReady.remove(p)
+                                        }
+                                    }
+                                    LogBus.add(tr("синтез фразы «${p.take(40)}» оборван объявлением, синтезирую заново", "synthesis of cue “${p.take(40)}” cut by an announcement, re-synthesizing"))
+                                } else {
+                                    cueResynthOnce.remove(p)
+                                    cuePlayWhenReady.remove(p)
+                                }
                                 return
                             }
                             ttsSpeaking = false
                             lastTtsEndTs = System.currentTimeMillis()
                             // симметрия с onDone/onError: оборванное объявление не должно
                             // вешать озвучку на страховочные 3.5с
-                            if (utteranceId == "announce") announceProceed?.let { main.post(it) }
+                            if (utteranceId == announceId) announceProceed?.let { main.post(it) }
                         }
                         override fun onDone(utteranceId: String?) {
                             if (utteranceId?.startsWith("cuefile_") == true) {
+                                pendingSynth.decrementAndGet()
                                 // v0.54: фразу ждали, чтобы сыграть — файл готов ровно сейчас
                                 val p = utteranceId.removePrefix("cuefile_")
+                                cueResynthOnce.remove(p)
+                                cuePendingUntil = System.currentTimeMillis() + 300
                                 if (cuePlayWhenReady.remove(p)) cueFiles[p]?.let { f ->
                                     if (f.exists() && f.length() > 200) main.post { if (alive) playCueFile(f) }
                                 }
@@ -3183,19 +3505,22 @@ class BridgeService : Service() {
                             }
                             ttsSpeaking = false
                             lastTtsEndTs = System.currentTimeMillis()
-                            if (utteranceId == "announce") announceProceed?.let { main.post(it) }
+                            if (utteranceId == announceId) announceProceed?.let { main.post(it) }
                         }
                         @Suppress("OVERRIDE_DEPRECATION")
                         override fun onError(utteranceId: String?) {
                             if (utteranceId?.startsWith("cuefile_") == true) {
+                                pendingSynth.decrementAndGet()
+                                val p = utteranceId.removePrefix("cuefile_")
+                                cueResynthOnce.remove(p)
                                 // v0.55 (ревью): иначе метка «сыграть по готовности» висит вечно
                                 // и однажды выстрелит не к месту, на чужом синтезе той же фразы
-                                cuePlayWhenReady.remove(utteranceId.removePrefix("cuefile_"))
+                                cuePlayWhenReady.remove(p)
                                 return
                             }
                             ttsSpeaking = false
                             lastTtsEndTs = System.currentTimeMillis()
-                            if (utteranceId == "announce") announceProceed?.let { main.post(it) }
+                            if (utteranceId == announceId) announceProceed?.let { main.post(it) }
                         }
                     })
                     prewarmCues()   // v0.38: реплики в файлы — играть их будем правильным маршрутом
@@ -3208,7 +3533,7 @@ class BridgeService : Service() {
 
     // ── dictation ─────────────────────────────────────────────────────────
     fun startListening() {
-        if (!alive || listening || playing) return
+        if (!alive || listening || playing || Cfg.voiceOff) return
         // v0.77 (прямое слово юзера с самоката: «я должен отвечать в ту сессию, которая
         // говорила последнее сообщение — обязательно и неизбежно»). Правило теперь общее,
         // а не только на границе каналов (v0.76): любой подъём микрофона откалывает
@@ -3219,23 +3544,23 @@ class BridgeService : Service() {
         if (Cfg.replyTarget.isNotEmpty() && lastSession != null && Cfg.replyTarget != lastSession &&
             audible(lastSession!!) && !speechInFlight() &&
             !SessionBook.isMuted(lastSession!!) &&   // в заглушённый канал отвечать нельзя
-            System.currentTimeMillis() - manualPinTs > 180000
+            !manualPinHolds()
         ) {
             Cfg.replyTarget = ""
             Cfg.save(this)
             lastAnnouncedTarget = null
-            LogBus.add("адресат откреплён: отвечаю тому, кто говорил последним («${lastSpokenName()}»)")
+            LogBus.add(tr("адресат откреплён: отвечаю тому, кто говорил последним («${lastSpokenName()}»)", "target unpinned: replying to whoever spoke last (“${lastSpokenName()}”)"))
             ensureTargetCues()
         }
         grabMediaButtons()   // v0.7: слушание = рабочий режим, кнопка наушников должна быть нашей
         // v0.36: проверка нужна ТОЛЬКО пути SpeechRecognizer — whisper пишет звук сам,
         // и на устройстве без сервисов Google он обязан работать
         if (!Cfg.whisper && !SpeechRecognizer.isRecognitionAvailable(this)) {
-            LogBus.add("распознавание речи недоступно на этом устройстве")
+            LogBus.add(tr("распознавание речи недоступно на этом устройстве", "speech recognition is unavailable on this device"))
             return
         }
         if (!hasMicPermission()) {
-            LogBus.add("нет разрешения на микрофон — открой приложение и выдай")
+            LogBus.add(tr("нет разрешения на микрофон — открой приложение и выдай", "no microphone permission — open the app and grant it"))
             beepBoth(ToneGenerator.TONE_PROP_NACK, 300)
             return
         }
@@ -3243,6 +3568,11 @@ class BridgeService : Service() {
         dictHold = false   // v0.37: любое поднятие микрофона снимает паузу диктовки
         micAsleep = false  // v0.50: проснулись
         listenStartedAt = System.currentTimeMillis()   // v0.12: свежеподнятый микрофон не усыплять
+        // v1.40 (боевое: «через три секунды после „ответь X, дальше Y“ уже играет Y — я и рта
+        // не открыл»): 12с зазора считались от объявления, а фраза, «слушаю» и подъём SCO съедали
+        // их почти целиком. Окно на ответ отсчитываем от РЕАЛЬНО поднятого микрофона.
+        if (boundarySid != null && listenStartedAt < boundaryHoldUntil)
+            boundaryHoldUntil = maxOf(boundaryHoldUntil, listenStartedAt + BOUNDARY_ANSWER_MS)
         retryDelay = 300L
         scoWaitCount = 0   // v0.36: свежий отсчёт ожидания SCO
         // v0.46 (аудит): noiseFloor не сбрасывался НИКОГДА (единственная запись — в onRmsChanged),
@@ -3283,7 +3613,7 @@ class BridgeService : Service() {
         // «кого я только что слушал» и «кому отвечу» становилось невидимым. Теперь имя звучит
         // ещё и тогда, когда отвечать предстоит НЕ ТОМУ, чья озвучка только что играла.
         val playedElsewhere = lastSession != null && tgtSid.isNotEmpty() && lastSession != tgtSid
-        if (playedElsewhere) LogBus.add("слушал «${SessionBook.all().firstOrNull { it.sid == lastSession }?.proj ?: "?"}», а отвечу в «${replyTargetName()}» — адресат закреплён")
+        if (playedElsewhere) LogBus.add(tr("слушал «${SessionBook.all().firstOrNull { it.sid == lastSession }?.proj ?: "?"}», а отвечу в «${replyTargetName()}» — адресат закреплён", "listened to “${SessionBook.all().firstOrNull { it.sid == lastSession }?.proj ?: "?"}”, but will reply to “${replyTargetName()}” — target pinned"))
         lastAnnouncedTarget = tgtSid
         // v0.76 (прямое слово юзера с самоката: «имя сессии, в которую я отвечаю, должно
         // проговариваться ВСЕГДА, во всех случаях»). Прежняя экономия (имя только на смену
@@ -3293,18 +3623,18 @@ class BridgeService : Service() {
         if (System.currentTimeMillis() < suppressListenCueUntil) suppressListenCueUntil = 0L
         else cue(listenCuePhrase())
         ensureTargetCues()            // не было в кэше — приготовим к следующему разу
-        LogBus.add(if (Cfg.handsFree) "слушаю (скажи «отправляй» в конце)" else "диктуй (нажми ещё раз — отправлю)")
-        LogBus.add("отвечаю в «${replyTargetName()}»")
+        LogBus.add(if (Cfg.handsFree) tr("слушаю (скажи «отправляй» в конце)", "listening (say “send” at the end)") else tr("диктуй (нажми ещё раз — отправлю)", "dictate (press again — I will send)"))
+        LogBus.add(tr("отвечаю в «${replyTargetName()}»", "replying to “${replyTargetName()}”"))
         // v0.15: видно, каким микрофоном пишем — от этого зависит, живёт ли кнопка гарнитуры
         // v0.51: строка печаталась ДО того, как канал реально поднялся, и врала «гарнитура»,
         // когда писал телефон (хвост №5 в CLAUDE.md). Теперь — что есть на самом деле.
         LogBus.add(when {
-            !Cfg.btMic -> "микрофон: телефон"
-            scoStarted -> "микрофон: гарнитура"
-            else -> "микрофон: жду канал гарнитуры (не отдаст — пишу телефоном)"
+            !Cfg.btMic -> tr("микрофон: телефон", "mic: phone")
+            scoStarted -> tr("микрофон: гарнитура", "mic: headset")
+            else -> tr("микрофон: жду канал гарнитуры (не отдаст — пишу телефоном)", "mic: waiting for headset channel (if it doesn't come, recording on phone)")
         })
         main.postDelayed({
-            if (alive && listening) LogBus.add("режим звука: ${audioManager.mode}, sco=$scoStarted, кнопка держится=${silentKeeper != null}")
+            if (alive && listening) LogBus.add(tr("режим звука: ${audioManager.mode}, sco=$scoStarted, кнопка держится=${silentKeeper != null}", "audio mode: ${audioManager.mode}, sco=$scoStarted, button held=${silentKeeper != null}"))
         }, 1500)
         // v0.26: даём реплике договорить, иначе распознаватель услышит наше же «слушаю»
         // v0.94 (слово юзера: «системные фразы часто слышно тихо — включай микрофон ПОСЛЕ
@@ -3393,7 +3723,7 @@ class BridgeService : Service() {
         // как завершённый — лить продолжение в мёртвый utt = потерять его. Начинаем новый.
         if (uttId.isNotEmpty() && uttSpeechMs > 0 &&
             System.currentTimeMillis() - lastFinalTs > 300000) {
-            LogBus.add("черновик старше 5 минут — начинаю новое сообщение")
+            LogBus.add(tr("черновик старше 5 минут — начинаю новое сообщение", "draft older than 5 minutes — starting a new message"))
             newUtt()
         }
         recThread = Thread { whisperLoop() }.also { it.isDaemon = true; it.start() }
@@ -3422,8 +3752,8 @@ class BridgeService : Service() {
             // SCO поднимется, живой VOICE_COMMUNICATION-поток перекинется на неё сам.
             if (scoWaitCount >= SCO_WAIT_MAX) {
                 if (scoWaitCount == SCO_WAIT_MAX) {
-                    LogBus.add("гарнитура не отдала микрофон ~8с — пишу с микрофона телефона (верну ей, как отдаст)")
-                    cue("гарнитура не отвечает")
+                    LogBus.add(tr("гарнитура не отдала микрофон ~8с — пишу с микрофона телефона (верну ей, как отдаст)", "headset did not give up the mic for ~8s — recording from the phone mic (will hand back when it releases)"))
+                    cue(tr("гарнитура не отвечает", "headset not responding"))
                     buzz(300)
                 }
                 return true
@@ -3432,7 +3762,7 @@ class BridgeService : Service() {
             return false
         }
         if (scoWaitCount == 0) {
-            LogBus.add("гарнитуры нет — пишу с микрофона телефона")
+            LogBus.add(tr("гарнитуры нет — пишу с микрофона телефона", "no headset — recording from the phone mic"))
             scoWaitCount = 1
         }
         return true
@@ -3460,7 +3790,7 @@ class BridgeService : Service() {
         // не теряя качества whisper (старый способ сравнения ронял распознавание в мусор).
         val src = if (Cfg.micVoiceComm) MediaRecorder.AudioSource.VOICE_COMMUNICATION
                   else MediaRecorder.AudioSource.VOICE_RECOGNITION
-        main.post { if (alive) LogBus.add("рекордер: источник " + (if (Cfg.micVoiceComm) "разговорный" else "распознавание") + " — жми кнопку, проверяем") }
+        main.post { if (alive) LogBus.add(tr("рекордер: источник ", "recorder: source ") + (if (Cfg.micVoiceComm) tr("разговорный", "voice-communication") else tr("распознавание", "recognition")) + tr(" — жми кнопку, проверяем", " — press the button, we are testing")) }
         val rec = try {
             AudioRecord(src, sr,
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, sr * 2))
@@ -3469,7 +3799,7 @@ class BridgeService : Service() {
             try { rec?.release() } catch (_: Exception) {}
             main.post {
                 if (!alive) return@post
-                LogBus.add("рекордер не поднялся — повтор через 1с")
+                LogBus.add(tr("рекордер не поднялся — повтор через 1с", "recorder did not start — retry in 1s"))
                 recThread = null
                 main.postDelayed({ if (alive && listening) startWhisperCycle() }, 1000)
             }
@@ -3506,6 +3836,12 @@ class BridgeService : Service() {
         // шум не даёт разрыва, и 90-секундный предел режет живой монолог): отправку, которую
         // выбрал ПОТОЛОК, а не человек, микрофон переживает бодрствуя — иначе хвост мысли гибнет.
         var capForced = false
+        var partsSent = false   // v1.42: потолок уже отгрузил части этого монолога
+        // v1.42 (боевое 15.10, лог whisper: сегмент обрезан по 20.0с посреди «Отправляе|шь»,
+        // обрубок принят за стоп-слово): после обрезки по длине следующий кусок уходит коротким
+        // (4с) — сервер, отложивший стоп-слово на обрезке, по нему за секунды видит, говорит ли
+        // человек дальше. Без пробы продолжение пришло бы через паузу или ещё через 20с.
+        var probeNext = false
         val frame = ShortArray(320)   // 20ms @ 16kHz
         val bytes = ByteArray(640)
         // v0.36 (аудит, этикет рации): очереди УБРАНЫ из условия цикла. Раньше прилетевший
@@ -3529,7 +3865,7 @@ class BridgeService : Service() {
             if (n <= 0) {
                 badReads++
                 if (badReads >= 25) {
-                    main.post { if (alive) LogBus.add("рекордер умер (код $n) — переподнимаю") }
+                    main.post { if (alive) LogBus.add(tr("рекордер умер (код $n) — переподнимаю", "recorder died (code $n) — restarting")) }
                     break
                 }
                 try { Thread.sleep(20) } catch (_: InterruptedException) {}
@@ -3585,20 +3921,36 @@ class BridgeService : Service() {
             }
             seg.write(bytes, 0, n * 2)
             val sendNowReq = finalizeReq
-            if (sendNowReq || (quietMs >= 2200 && segSpeechMs >= 500) || seg.size() >= sr * 2 * 20) {
+            val byPause = quietMs >= 2200 && segSpeechMs >= 500
+            // v1.42: проба после обрезки — от 4с, как только в ней есть речь. Не гаснет без речи
+            // (ревью): человек, продолживший на 4.1с, иначе ждал бы 20с, а сервер закрыл бы
+            // сообщение по сроку. Молчит — проба не уходит, сервер по сроку примет команду.
+            val byProbe = probeNext && seg.size() >= sr * 2 * 4 && segSpeechMs >= 300
+            val byLen = seg.size() >= sr * 2 * 20
+            if (sendNowReq || byPause || byLen || byProbe) {
                 val hasSpeech = segSpeechMs >= 300
                 if (sendNowReq) {
                     finalizeReq = false
                     // v0.50: «отправили что-то» = речь в этом сегменте ИЛИ уже отгруженная речь
                     // в этом utt (uttSpeechMs обнуляется ниже в newUtt — читаем ДО него)
                     val sentSomething = hasSpeech || uttSpeechMs > 0
-                    uploadSeg(if (hasSpeech) seg.toByteArray() else ByteArray(0), true)
-                    lastFinalTs = now
                     val byCap = capForced
+                    // v1.41: дорезанное потолком — часть монолога: помечаем ДО отгрузки (utt_sent
+                    // может прийти раньше, чем рекордер дойдёт до следующей строки)
+                    if (uttDict.size > 50) { uttDict.clear(); capPartUtts.clear() }
+                    if (uttId.isNotEmpty()) uttDict[uttId] = listenStartedAt
+                    if (byCap) {
+                        capPartUtts[uttId] = listenStartedAt; capPartAt = now
+                        if (sentSomething) partsSent = true
+                        if (hasSpeech) lastRealSpeechTs = now   // придержка видит живую речь
+                    }
+                    uploadSeg(if (hasSpeech) seg.toByteArray() else ByteArray(0), true, part = byCap)
+                    lastFinalTs = now
+                    probeNext = false
                     main.post {
                         if (alive) LogBus.add(
-                            if (byCap) "ушло на распознавание (дорезал потолок — говори дальше, микрофон не сплю)"
-                            else "ушло на распознавание"
+                            if (byCap) tr("ушло на распознавание (дорезал потолок — говори дальше, микрофон не сплю)", "sent to recognition (cut by the cap — keep talking, mic stays awake)")
+                            else tr("ушло на распознавание", "sent to recognition")
                         )
                     }
                     seg.reset(); segSpeechMs = 0; quietMs = 0; quietSoftMs = 0; warned = false
@@ -3607,11 +3959,17 @@ class BridgeService : Service() {
                     capForced = false
                     // v0.50: одно сообщение на ответ. v0.52: но только если отправку выбрал человек —
                     // дорезанный потолком монолог продолжается в следующее сообщение, микрофон живёт.
-                    if (sentSomething && !byCap) { sleepReq = true; break }
+                    // v1.41 (ревью): кнопка после молча доехавших частей — хвост пуст, но монолог
+                    // отправлен: спим, как после любой отправки
+                    if ((sentSomething || partsSent) && !byCap) { sleepReq = true; break }
                     continue
                 }
+                // v1.42: «обрезан посреди речи» — по длине или пробой, но не на паузе: сервер
+                // не финализирует стоп-слово в хвосте такого куска, пока не увидит следующий
+                val cutMid = if (byPause) "" else if (byLen) "len" else if (byProbe) "probe" else ""
+                probeNext = hasSpeech && cutMid == "len"
                 if (hasSpeech) {
-                    uploadSeg(seg.toByteArray(), false); uttSpeechMs += segSpeechMs; lastFinalTs = now
+                    uploadSeg(seg.toByteArray(), false, cut = cutMid); uttSpeechMs += segSpeechMs; lastFinalTs = now
                     lastRealSpeechTs = now   // v0.98: подтверждённая речь продлевает придержку
                     // v0.42 (боевое «потолок 45с отрезал живую диктовку посреди мысли»):
                     // отгруженный сегмент = живая диктовка продолжается, потолок отодвигается.
@@ -3636,8 +3994,8 @@ class BridgeService : Service() {
                         if (!alive) return@post
                         beepBoth(ToneGenerator.TONE_PROP_BEEP, 90)
                         LogBus.add(
-                            ("бип (whisper): тихо %.1fс (жёстко %.1fс) | фон-мягкий %.1f жёсткий %.1f " +
-                                "db %.1f речи в сегменте %dмс").format(qs / 1000f, qh / 1000f, fl, wf, dbNow, sp)
+                            (tr("бип (whisper): тихо %.1fс (жёстко %.1fс) | фон-мягкий %.1f жёсткий %.1f ", "beep (whisper): quiet %.1fs (hard %.1fs) | floor-soft %.1f hard %.1f ") +
+                                tr("db %.1f речи в сегменте %dмс", "db %.1f speech in segment %dms")).format(qs / 1000f, qh / 1000f, fl, wf, dbNow, sp)
                         )
                     }
                 }
@@ -3645,7 +4003,7 @@ class BridgeService : Service() {
                 // потолок удержания: второй механизм баланса v0.22 — что бы ни творил шум,
                 // взведённый черновик уходит не позже чем через 45с
                 if (now - armedTs > 45000) {
-                    main.post { if (alive) LogBus.add("потолок удержания 45с — отправляю принудительно") }
+                    main.post { if (alive) LogBus.add(tr("потолок удержания 45с — отправляю принудительно", "hold cap 45s — forcing send")) }
                     finalizeReq = true
                     capForced = true   // v0.52: дорезал потолок — не спать, человек ещё говорит
                 }
@@ -3654,7 +4012,7 @@ class BridgeService : Service() {
                 // только вместе с самим черновиком (newUtt). Настенное «now - firstArmWh» тикало бы
                 // и во время озвучки, а локальная переменная обнулялась каждым ответом сессии.
                 if (whArmedMs > HARD_CAP_MS) {
-                    main.post { if (alive) LogBus.add("предел 90с записи — отправляю принудительно") }
+                    main.post { if (alive) LogBus.add(tr("предел 90с записи — отправляю принудительно", "90s recording limit — forcing send")) }
                     finalizeReq = true
                     capForced = true   // v0.52: на самокате 90с набираются за полторы минуты живой речи
                 }
@@ -3677,7 +4035,7 @@ class BridgeService : Service() {
             // «ничего не расслышал» падала поверх играющего ответа.
             if (uttSpeechMs == 0 && segSpeechMs < 300) {
                 postCancel(uttId)
-                LogBus.add("закрыл пустую диктовку — на сервер ничего не слал")
+                LogBus.add(tr("закрыл пустую диктовку — на сервер ничего не слал", "closed empty dictation — nothing sent to the server"))
             } else {
                 uploadSeg(if (segSpeechMs >= 300) seg.toByteArray() else ByteArray(0), true)
             }
@@ -3703,13 +4061,19 @@ class BridgeService : Service() {
         return out.toByteArray()
     }
 
-    private fun uploadSeg(pcm: ByteArray, fin: Boolean) {
+    // part=true (v1.41) — финал части, дорезанной потолком: «ушло» по ней не звучит, ждать его незачем
+    // cut (v1.42) — сегмент обрезан посреди речи, не на паузе: "len" по 20с, "probe" — 4с-проба после
+    // такой обрезки. Последнее слово может быть обрубком («Отправляе|шь»): сервер не примет его за
+    // стоп-слово, не увидев продолжения (после "probe" ждёт дольше — следующий кусок до 20с)
+    private fun uploadSeg(pcm: ByteArray, fin: Boolean, part: Boolean = false, cut: String = "") {
         val u = uttId
         // v0.51 (ревью): utt закрыт и очищен сном — хвост, дописанный рекордером на выходе,
         // отбрасываем. НО не молча: молчаливые потери в этом проекте уже стоили дней гадания.
+        // v1.42: отдельным сообщением хвост больше не спасаем (слово владельца): после законного
+        // «отправляй» это повтор команды или шум, а ложный финал на обрезке лечит сервер (cut).
         if (u.isEmpty()) {
             if (pcm.isNotEmpty()) main.post {
-                if (alive) LogBus.add("хвост после отправки отброшен (${pcm.size / 32000}с речи)")
+                if (alive) LogBus.add(tr("хвост после отправки отброшен (${pcm.size / 32000}с речи)", "tail after send dropped (${pcm.size / 32000}s of speech)"))
             }
             return
         }
@@ -3719,8 +4083,8 @@ class BridgeService : Service() {
         if (sid.isEmpty()) {
             main.post {
                 if (!alive) return@post
-                LogBus.add("сегмент не отправлен: не знаю сессию-адресата (нажми «говорить» — уточню у релея)")
-                if (fin) { cue("не знаю, кому отправить"); buzz(400) }   // v0.36 (ревью): финал не должен быть немым
+                LogBus.add(tr("сегмент не отправлен: не знаю сессию-адресата (нажми «говорить» — уточню у релея)", "segment not sent: target session unknown (press “talk” — will ask the relay)"))
+                if (fin) { cue(tr("не знаю, кому отправить", "no one to send to")); buzz(400) }   // v0.36 (ревью): финал не должен быть немым
             }
             return
         }
@@ -3735,7 +4099,7 @@ class BridgeService : Service() {
             // в котором whisper не нашёл слов) живёт отдельно и на улице резала посреди мысли:
             // в ветер слов не находится, и «тишина» набиралась ровно пока человек говорил.
             .url("${Cfg.url}/utt?token=${Cfg.token}&session=$sid&utt=$u&seq=$q&v=${BuildConfig.VERSION_CODE}" +
-                (if (!Cfg.autoSend) "&nosil=1" else "") + (if (fin) "&final=1" else ""))
+                (if (!Cfg.autoSend) "&nosil=1" else "") + (if (fin) "&final=1" else "") + (if (cut.isNotEmpty()) "&cut=$cut" else ""))
             .post(body).build()
         // v0.36: после финала ждём подтверждение сервера — иначе смерть voice-whisper невидима
         // v1.13 (боевое: «ответил в первую сессию — и сразу пошла озвучка второй, а „ушло“ я не
@@ -3746,16 +4110,16 @@ class BridgeService : Service() {
         if (fin) main.post {
             if (alive) {
                 armUttAckTimer(u)
-                awaitSendCueUntil = System.currentTimeMillis() + 6000
+                if (!part) awaitSendCueUntil = System.currentTimeMillis() + 6000
             }
         }
         http.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                main.post { if (alive) LogBus.add("сегмент не ушёл (" + (e.message?.take(30) ?: "?") + ") — повтор через 3с") }
+                main.post { if (alive) LogBus.add(tr("сегмент не ушёл (", "segment not sent (") + (e.message?.take(30) ?: "?") + tr(") — повтор через 3с", ") — retry in 3s")) }
                 main.postDelayed({
                     http.newCall(req).enqueue(object : Callback {
                         override fun onFailure(c: Call, e2: IOException) {
-                            main.post { if (alive) { LogBus.add("сегмент ПОТЕРЯН: " + (e2.message?.take(40) ?: "?")); buzz(300) } }
+                            main.post { if (alive) { LogBus.add(tr("сегмент ПОТЕРЯН: ", "segment LOST: ") + (e2.message?.take(40) ?: "?")); buzz(300) } }
                         }
                         override fun onResponse(c: Call, r: Response) { r.close() }
                     })
@@ -3777,7 +4141,7 @@ class BridgeService : Service() {
                 main.postDelayed({
                     http.newCall(req).enqueue(object : Callback {
                         override fun onFailure(c: Call, e2: IOException) {
-                            main.post { if (alive) LogBus.add("отмена не доехала до сервера — обрывок может прийти позже") }
+                            main.post { if (alive) LogBus.add(tr("отмена не доехала до сервера — обрывок может прийти позже", "cancel did not reach the server — a fragment may arrive later")) }
                         }
                         override fun onResponse(c: Call, r: Response) { r.close() }
                     })
@@ -3830,7 +4194,7 @@ class BridgeService : Service() {
                     if (pendingSend) { finishPendingSend(); return }
                     when (error) {
                         SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                            LogBus.add("нет разрешения на микрофон — диктовка выключена")
+                            LogBus.add(tr("нет разрешения на микрофон — диктовка выключена", "no microphone permission — dictation off"))
                             stopListening()
                         }
                         // v0.5.5 (боевое «куча ошибок код 5, распознавание выключено»): ERROR_CLIENT — это
@@ -3840,7 +4204,7 @@ class BridgeService : Service() {
                         SpeechRecognizer.ERROR_CLIENT -> {
                             clientErrStreak++
                             if (clientErrStreak >= 20) {
-                                LogBus.add("распознавание сыпет код 5 подряд ($clientErrStreak) — диктовка выключена, черновик доедет автоотправкой")
+                                LogBus.add(tr("распознавание сыпет код 5 подряд ($clientErrStreak) — диктовка выключена, черновик доедет автоотправкой", "recognizer keeps throwing error 5 ($clientErrStreak) in a row — dictation off, draft will go out via auto-send"))
                                 stopListening()
                             } else if (listening) {
                                 // v0.7.1: таймер НЕ трогаем — в RMS-архитектуре его заводит только новый финал
@@ -3944,7 +4308,7 @@ class BridgeService : Service() {
             })
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, Lang.recognizerTag)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                 // v0.46 (аудит): флаг не выставлялся НИГДЕ, а по контракту Android дефолт — false.
                 // Значит весь партиальный тракт (v0.30/v0.34 и живость отсчёта по догадкам) мог
@@ -3966,7 +4330,7 @@ class BridgeService : Service() {
         if (heldQueue.isEmpty()) return false
         val n = heldQueue.size
         while (heldQueue.isNotEmpty()) playQueue.addLast(heldQueue.removeFirst())
-        LogBus.add("играю накопленное: $n част.")
+        LogBus.add(tr("играю накопленное: $n част.", "playing backlog: $n parts"))
         updateNotification()
         kickPlayback()
         return true
@@ -3980,8 +4344,12 @@ class BridgeService : Service() {
     private fun gapOpen(): Boolean =
         boundarySid != null && System.currentTimeMillis() < boundaryHoldUntil
 
+    // v1.16-fix: ручной выбор другого канала во время озвучки главнее «ответь договорившему» —
+    // иначе тап по кругу в зазоре увёл бы диктовку обратно в того, кого юзер уже сменил
     fun boundaryReplySid(): String =
-        if (boundarySid != null && System.currentTimeMillis() < boundaryHoldUntil) (lastSession ?: "") else ""
+        if (boundarySid != null && System.currentTimeMillis() < boundaryHoldUntil &&
+            !(manualPinHolds() && Cfg.replyTarget.isNotEmpty() && Cfg.replyTarget != lastSession)
+        ) (lastSession ?: "") else ""
 
     fun boundaryNextName(): String {
         val s = boundarySid ?: return ""
@@ -4003,13 +4371,14 @@ class BridgeService : Service() {
     // а сброс dictHold молча выключал бы режим «не слушать» (v0.43) — ровно в тот момент,
     // ради которого его и включают: слушать ответы, не записывая улицу.
     fun listenIntent() {
+        if (Cfg.voiceOff) toggleVoiceOff(announce = false)   // v1.28: явное «слушать» = хочу слышать
         touchUser()
         if (listening) stopListening()
         holdSince = 0L
         // v0.73.1 (боевое: «жму послушать — ничего»): playNext первым делом выходит при
         // paused, а круг с v0.71 ставит именно паузу — залипшая пауза глушила ВСЁ, что мы
         // сейчас поставим в очередь. Снимаем её, не трогая очередей (ничего не теряется).
-        if (paused) { LogBus.add("явное «слушать» — снимаю паузу"); resumePlayback() }
+        if (paused) { LogBus.add(tr("явное «слушать» — снимаю паузу", "explicit “listen” — releasing pause")); resumePlayback() }
         // Зазор между каналами существует для того, что валится САМО. Когда юзер ткнул
         // «слушать» пальцем, двенадцать секунд тишины в ответ — издевательство (и сторож
         // немого нажатия успевал соврать «не могу играть»). Гасим зазор на этот заход.
@@ -4025,12 +4394,12 @@ class BridgeService : Service() {
             if (!alive) return@postDelayed
             if (!playing && (playQueue.isNotEmpty() || fileQueue.isNotEmpty())) {
                 val noHs = holdForHeadset()
-                LogBus.add("«$what»: звука нет — " + when {
-                    noHs -> "включено «только в наушниках», а их нет"
-                    paused -> "рация на паузе"
-                    else -> "очередь стоит"
+                LogBus.add(tr("«$what»: звука нет — ", "“$what”: no sound — ") + when {
+                    noHs -> tr("включено «только в наушниках», а их нет", "“headphones only” is on and there are none")
+                    paused -> tr("рация на паузе", "radio is paused")
+                    else -> tr("очередь стоит", "queue is stalled")
                 })
-                cue(if (noHs) "надень наушники" else "не могу играть")
+                cue(if (noHs) tr("надень наушники", "put on your headphones") else tr("не могу играть", "can't play"))
                 buzz(300)
             }
         }, 2500)
@@ -4040,7 +4409,7 @@ class BridgeService : Service() {
     fun playHeldAll(): Boolean {
         listenIntent()
         val ok = playHeld()
-        if (ok) watchSilentPlay("все подряд")
+        if (ok) watchSilentPlay(tr("все подряд", "all"))
         return ok
     }
 
@@ -4077,10 +4446,10 @@ class BridgeService : Service() {
         // и снимаем «доигрываю сообщение текущего канала»: иначе остаток чужого многочастного
         // ответа всё равно шёл бы первым, а юзер явно выбрал этот канал (он сыграет следом)
         currentSid = null
-        LogBus.add("играю накопленное «${mine.first().optString("proj").ifEmpty { sid.take(8) }}»: ${mine.size} ч.")
+        LogBus.add(tr("играю накопленное «${mine.first().optString("proj").ifEmpty { sid.take(8) }}»: ${mine.size} ч.", "playing backlog “${mine.first().optString("proj").ifEmpty { sid.take(8) }}”: ${mine.size} parts"))
         updateNotification()
         kickPlayback()
-        watchSilentPlay("слушать канал")
+        watchSilentPlay(tr("слушать канал", "listen to channel"))
         return true
     }
 
@@ -4099,7 +4468,7 @@ class BridgeService : Service() {
         }
         heldQueue.clear()
         for (o in keep) heldQueue.addLast(o)
-        if (n > 0) LogBus.add("пропустил накопленное: $n ч. — они остаются в ленте канала")
+        if (n > 0) LogBus.add(tr("пропустил накопленное: $n ч. — они остаются в ленте канала", "skipped backlog: $n parts — they stay in the channel feed"))
         updateNotification()
         return n
     }
@@ -4109,7 +4478,7 @@ class BridgeService : Service() {
         Thread {
             try {
                 val raw = Net.get(Cfg.pin, "${Cfg.url}/sessions?token=${Cfg.token}") ?: run {
-                    main.post { LogBus.add("крайнее: нет связи с релеем") }; return@Thread
+                    main.post { LogBus.add(tr("крайнее: нет связи с релеем", "latest: no connection to the relay")) }; return@Thread
                 }
                 val arr = JSONObject(raw).optJSONArray("sessions") ?: return@Thread
                 var bestSid = ""; var bestProj = ""; var bestTs = 0L
@@ -4117,7 +4486,7 @@ class BridgeService : Service() {
                     val o = arr.getJSONObject(i)
                     if (o.optLong("lastTs") > bestTs) { bestTs = o.optLong("lastTs"); bestSid = o.getString("sid"); bestProj = o.optString("proj") }
                 }
-                if (bestSid.isEmpty()) { main.post { LogBus.add("крайнее: на релее пусто") }; return@Thread }
+                if (bestSid.isEmpty()) { main.post { LogBus.add(tr("крайнее: на релее пусто", "latest: relay is empty")) }; return@Thread }
                 val hraw = Net.get(Cfg.pin, "${Cfg.url}/history?token=${Cfg.token}&session=$bestSid&limit=30") ?: return@Thread
                 val evs = JSONObject(hraw).optJSONArray("events") ?: return@Thread
                 // последнее СООБЩЕНИЕ = все части старшего msgid
@@ -4137,10 +4506,10 @@ class BridgeService : Service() {
                 val proj = bestProj
                 main.post {
                     if (!alive) return@post
-                    LogBus.add("крайнее: играю последнее из «${proj}»")
+                    LogBus.add(tr("крайнее: играю последнее из «${proj}»", "latest: playing the last one from “${proj}”"))
                     playFrom(bestSid, proj, items)
                 }
-            } catch (e: Exception) { main.post { LogBus.add("крайнее: ошибка ${e.message?.take(60)}") } }
+            } catch (e: Exception) { main.post { LogBus.add(tr("крайнее: ошибка ${e.message?.take(60)}", "latest: error ${e.message?.take(60)}")) } }
         }.start()
     }
 
@@ -4157,29 +4526,30 @@ class BridgeService : Service() {
     // вообще, и приложение выглядит мёртвым. Теперь микрофон встаёт СРАЗУ, а адресата
     // уточняем в фоне: диктовка не должна зависеть от сети.
     fun talkNow() {
+        if (Cfg.voiceOff) toggleVoiceOff(announce = false)   // v1.28: «говорить» без голоса — сначала вернуть голос
         touchUser()
         if (listening) { sendNow(); return }
         // v0.36 (аудит): раньше во время озвучки тангента молча НЕ ДЕЛАЛА НИЧЕГО (гейт playing
         // в startListening), а журнал врал «поднимаю микрофон». Теперь — как двойное нажатие
         // гарнитуры: прервать и сразу диктовать.
         if (playing || paused) {
-            LogBus.add("тангента: прерываю озвучку — диктуй")
+            LogBus.add(tr("тангента: прерываю озвучку — диктуй", "push-to-talk: interrupting playback — dictate"))
             stopPlayback(thenListen = true)
             return
         }
-        LogBus.add("кнопка «говорить» — поднимаю микрофон")
+        LogBus.add(tr("кнопка «говорить» — поднимаю микрофон", "“talk” button — raising the mic"))
         startListening()
         if (Cfg.replyTarget.isEmpty() && lastSession == null) replyToLatest()
     }
 
     fun replyToLatest() {
         if (replyLatestBusy) return
-        if (listening) { LogBus.add("уже слушаю — просто диктуй"); return }
+        if (listening) { LogBus.add(tr("уже слушаю — просто диктуй", "already listening — just dictate")); return }
         replyLatestBusy = true
         Thread {
             try {
                 val raw = Net.get(Cfg.pin, "${Cfg.url}/sessions?token=${Cfg.token}") ?: run {
-                    main.post { LogBus.add("ответ в крайнюю: нет связи с релеем") }; return@Thread
+                    main.post { LogBus.add(tr("ответ в крайнюю: нет связи с релеем", "reply to latest: no connection to the relay")) }; return@Thread
                 }
                 val arr = JSONObject(raw).optJSONArray("sessions") ?: return@Thread
                 // v0.37 (боевое: диктовка уходила в сессию с мёртвым поллером и копилась в
@@ -4195,18 +4565,23 @@ class BridgeService : Service() {
                 }
                 val deadTarget = aliveSid.isEmpty()
                 if (aliveSid.isNotEmpty()) { bestSid = aliveSid; bestProj = aliveProj }
-                if (bestSid.isEmpty()) { main.post { LogBus.add("ответ в крайнюю: на релее пусто") }; return@Thread }
+                if (bestSid.isEmpty()) { main.post { LogBus.add(tr("ответ в крайнюю: на релее пусто", "reply to latest: relay is empty")) }; return@Thread }
                 main.post {
                     if (!alive) return@post
+                    // v1.16-fix: пока шёл запрос, юзер мог выбрать канал руками — не перебиваем
+                    if (Cfg.replyTarget.isNotEmpty() && manualPinHolds()) {
+                        if (!listening) startListening()
+                        return@post
+                    }
                     Cfg.replyTarget = bestSid
                     Cfg.save(this@BridgeService)
                     ensureTargetCues()   // v0.51: имя адресата — голосом
-                    LogBus.add("отвечаю в «$bestProj» — диктуй")
-                    if (deadTarget) LogBus.add("ВНИМАНИЕ: живых сессий на релее нет — сообщения могут ждать в очереди")
+                    LogBus.add(tr("отвечаю в «$bestProj» — диктуй", "replying to “$bestProj” — dictate"))
+                    if (deadTarget) LogBus.add(tr("ВНИМАНИЕ: живых сессий на релее нет — сообщения могут ждать в очереди", "WARNING: no live sessions on the relay — messages may wait in the queue"))
                     beepBoth(ToneGenerator.TONE_PROP_PROMPT, 120)
                     if (!listening) startListening()
                 }
-            } catch (e: Exception) { main.post { LogBus.add("ответ в крайнюю: ошибка ${e.message?.take(50)}") } }
+            } catch (e: Exception) { main.post { LogBus.add(tr("ответ в крайнюю: ошибка ${e.message?.take(50)}", "reply to latest: error ${e.message?.take(50)}")) } }
             finally { replyLatestBusy = false }
         }.start()
     }
@@ -4217,7 +4592,7 @@ class BridgeService : Service() {
         Cfg.speed = (Cfg.speed + delta).coerceIn(0.7f, 2.0f)
         Cfg.save(this)
         applySpeedNow()
-        LogBus.add("скорость озвучки: ${"%.1f".format(Cfg.speed)}×")
+        LogBus.add(tr("скорость озвучки: ${"%.1f".format(Cfg.speed)}×", "playback speed: ${"%.1f".format(Cfg.speed)}×"))
         return Cfg.speed
     }
 
@@ -4272,13 +4647,13 @@ class BridgeService : Service() {
         // снова, не доставая телефон, поэтому приоритет забираем сразу и ещё раз после устаканивания.
         grabMediaButtons()
         main.postDelayed({ if (alive) grabMediaButtons() }, 1600)
-        LogBus.add("сообщение ушло — микрофон спит (разбудит кнопка, тангента или ответ)")
+        LogBus.add(tr("сообщение ушло — микрофон спит (разбудит кнопка, тангента или ответ)", "message sent — mic asleep (button, push-to-talk or a reply will wake it)"))
         // v0.65: прошлая сессия получила ответ — зазор на границе сессий больше не нужен,
         // очередь едет дальше немедленно, не досиживая свой потолок.
         if (boundarySid != null) {
             boundarySid = null
             boundaryHoldUntil = 0L
-            LogBus.add("ответ отправлен — пускаю следующую сессию")
+            LogBus.add(tr("ответ отправлен — пускаю следующую сессию", "reply sent — letting the next session through"))
             kickPlayback()
         }
     }
@@ -4312,8 +4687,8 @@ class BridgeService : Service() {
         // Locale.US: на русской локали %.1f печатает запятую — числа в журнале должны быть с точкой
         return String.format(
             java.util.Locale.US,
-            "фон %.1f порог %.1f rms %.1f..%.1f кадров %d голосом %d | догадок %d (нов %d, рост %d)" +
-                " | речь %.1fс назад, текст %.1fс назад",
+            tr("фон %.1f порог %.1f rms %.1f..%.1f кадров %d голосом %d | догадок %d (нов %d, рост %d)", "floor %.1f threshold %.1f rms %.1f..%.1f frames %d voiced %d | guesses %d (new %d, grew %d)") +
+                tr(" | речь %.1fс назад, текст %.1fс назад", " | speech %.1fs ago, text %.1fs ago"),
             noiseFloor, noiseFloor + 5.5f, lo, hi, rmsFrames, rmsVoiceFrames,
             partialsSeen, partialsNew, partialsGrow,
             actAgo, txtAgo
@@ -4325,9 +4700,9 @@ class BridgeService : Service() {
         // эхо-гейтом (gatedFrames) и сессия распознавателя реально работала (recActive). При
         // придержке ответа (гейт очереди) и в бэкоффе кадров честно ноль — это не поломка.
         if (rmsFrames == 0) LogBus.add(when {
-            gatedFrames > 0 -> "RMS заглушён эхо-гейтом ($gatedFrames кадров) — датчик жив"
-            !recActive -> "RMS нет: распознаватель в перезапуске или ждёт очередь озвучки"
-            else -> "RMS не приходит вовсе — датчик МЁРТВ, а не слеп"
+            gatedFrames > 0 -> tr("RMS заглушён эхо-гейтом ($gatedFrames кадров) — датчик жив", "RMS muted by the echo gate ($gatedFrames frames) — sensor alive")
+            !recActive -> tr("RMS нет: распознаватель в перезапуске или ждёт очередь озвучки", "no RMS: recognizer is restarting or waiting for the playback queue")
+            else -> tr("RMS не приходит вовсе — датчик МЁРТВ, а не слеп", "RMS not arriving at all — sensor DEAD, not blind")
         })
         rmsFrames = 0; rmsVoiceFrames = 0; gatedFrames = 0
         rmsMin = Float.MAX_VALUE; rmsMax = -Float.MAX_VALUE
@@ -4343,13 +4718,13 @@ class BridgeService : Service() {
         val partialFresh = lastPartial.isNotEmpty() &&
             System.currentTimeMillis() - lastPartialTs < PARTIAL_FRESH_MS
         if (draft.isEmpty() && !partialFresh) return
-        if (!Cfg.handsFree) { LogBus.add("отсчёт тишины НЕ идёт: выключен безрукий режим"); return }
-        if (!Cfg.autoSend) { LogBus.add("отсчёт тишины НЕ идёт: выключена галочка авто-отправки"); return }
+        if (!Cfg.handsFree) { LogBus.add(tr("отсчёт тишины НЕ идёт: выключен безрукий режим", "silence countdown NOT running: hands-free mode is off")); return }
+        if (!Cfg.autoSend) { LogBus.add(tr("отсчёт тишины НЕ идёт: выключена галочка авто-отправки", "silence countdown NOT running: auto-send checkbox is off")); return }
         val armNow = System.currentTimeMillis()
         if (firstArmTs == 0L) firstArmTs = armNow
         if (lastTextTs == 0L) lastTextTs = armNow
         if (lastActivityTs == 0L) lastActivityTs = armNow
-        LogBus.add("отсчёт тишины: 10с до бипа")
+        LogBus.add(tr("отсчёт тишины: 10с до бипа", "silence countdown: 10s to beep"))
         // v0.5.5 (кейс «пикает/тихо, но не отправляет в полной тишине»): гейт `listening` УБРАН из warn/fire —
         // если распознаватель умер (код 5) между набором черновика и выстрелом, сообщение ВСЁ РАВНО уходит.
         // Черновик есть = отправляем; живость распознавания — не условие доставки.
@@ -4372,8 +4747,8 @@ class BridgeService : Service() {
                 // остальное — не чаще раза в 5с, зато сразу с числами датчика
                 if (now - lastSensorLogTs > 5000) {
                     lastSensorLogTs = now
-                    val ch = if (noTextFor < 1500) "текст" else "громкость"
-                    LogBus.add("ты ещё говоришь ($ch) — отсчёт заново | " + sensorLine(now))
+                    val ch = if (noTextFor < 1500) tr("текст", "text") else tr("громкость", "volume")
+                    LogBus.add(tr("ты ещё говоришь ($ch) — отсчёт заново | ", "you are still talking ($ch) — countdown restarted | ") + sensorLine(now))
                     sensorWindowReset()
                 }
                 autoSendTimer = this
@@ -4381,13 +4756,13 @@ class BridgeService : Service() {
                 return
             }
             val reason = when {
-                quietFor >= 10000 -> "тишина ${quietFor / 1000}с"
-                noTextFor >= SOFT_CAP_MS -> "потолок 30с без нового текста"
-                else -> "предел 90с"
+                quietFor >= 10000 -> tr("тишина ${quietFor / 1000}с", "silence ${quietFor / 1000}s")
+                noTextFor >= SOFT_CAP_MS -> tr("потолок 30с без нового текста", "30s cap with no new text")
+                else -> tr("предел 90с", "90s limit")
             }
             beepAtTs = now
             beepBoth(ToneGenerator.TONE_PROP_BEEP, 90)
-            LogBus.add("бип: причина=$reason | " + sensorLine(now) + " | перевзводов $sendRearms")
+            LogBus.add(tr("бип: причина=$reason | ", "beep: reason=$reason | ") + sensorLine(now) + tr(" | перевзводов $sendRearms", " | re-arms $sendRearms"))
             sensorWindowReset()
             // v0.7: выстрел уважает ЖИВУЮ речь по громкости (RMS), а не по нервному «началу речи»:
             // громко у микрофона прямо сейчас → подождать 1.5с (до 8 раз), потом слать в любом случае.
@@ -4402,14 +4777,14 @@ class BridgeService : Service() {
                     // больше REARM_MAX раз, и абсолютный потолок 90с всё равно сверху.
                     if (lastTextTs > beepAtTs && sendRearms < REARM_MAX && n2 - firstArmTs < HARD_CAP_MS) {
                         sendRearms++
-                        LogBus.add("после бипа пришёл текст — отсчёт перевзведён ($sendRearms/$REARM_MAX)")
+                        LogBus.add(tr("после бипа пришёл текст — отсчёт перевзведён ($sendRearms/$REARM_MAX)", "text arrived after the beep — countdown re-armed ($sendRearms/$REARM_MAX)"))
                         val w = warnRef
                         if (w != null) { autoSendTimer = w; main.postDelayed(w, 10000); return }
                     }
                     // v0.11: вторая ступень тоже слушает голос ОТНОСИТЕЛЬНО фона, а не по жёсткому 7dB
                     if (n2 - lastVoiceTs < 1500 && postpones < 8) {
                         postpones++
-                        if (postpones == 1) LogBus.add("слышу голос — жду паузу…")
+                        if (postpones == 1) LogBus.add(tr("слышу голос — жду паузу…", "hearing voice — waiting for a pause…"))
                         autoSendTimer = this
                         main.postDelayed(this, 1500)
                         return
@@ -4424,13 +4799,13 @@ class BridgeService : Service() {
                         // 30с всё так же отсекает обрывки получасовой давности.
                         if (n2 - lastPartialTs < SOFT_CAP_MS) {
                             val c = cleanPartialForSend(lastPartial)   // догадка идёт мимо onFinalText — та же нормализация
-                            if (c == null) LogBus.add("догадка = «отмена» — не отправляю")
+                            if (c == null) LogBus.add(tr("догадка = «отмена» — не отправляю", "guess = “cancel” — not sending"))
                             else {
                                 msg = c
-                                if (msg.isNotEmpty()) LogBus.add("финалов не было — шлю распознанное на лету")
+                                if (msg.isNotEmpty()) LogBus.add(tr("финалов не было — шлю распознанное на лету", "no finals — sending what was recognized on the fly"))
                             }
                         } else {
-                            LogBus.add("нечего отправлять — догадка протухла (${(n2 - lastPartialTs) / 1000}с)")
+                            LogBus.add(tr("нечего отправлять — догадка протухла (${(n2 - lastPartialTs) / 1000}с)", "nothing to send — guess went stale (${(n2 - lastPartialTs) / 1000}s)"))
                         }
                     }
                     lastPartial = ""
@@ -4441,13 +4816,13 @@ class BridgeService : Service() {
                     cancelAutoSend()
                     resetSendWindow()
                     if (msg.isNotEmpty()) {
-                        LogBus.add("авто-отправка: причина=$reason (отсрочек $postpones)")
+                        LogBus.add(tr("авто-отправка: причина=$reason (отсрочек $postpones)", "auto-send: reason=$reason (postponed $postpones times)"))
                         send(msg)
                         // v0.52 (боевое, логи с самоката 30.07): спим ТОЛЬКО когда отправку выбрала
                         // ТИШИНА, то есть человек замолчал. Если дорезал потолок (30с без нового
                         // текста, 90с абсолюта) — человек ЕЩЁ ГОВОРИТ, и сон отрезал бы ему хвост
                         // мысли: ровно жалоба «я ещё говорю, а оно уже ушло», только теперь молча.
-                        if (reason.startsWith("тишина")) sleepAfterSend()
+                        if (reason.startsWith(tr("тишина", "silence"))) sleepAfterSend()
                         // v0.46-fix: если ушла ДОГАДКА (не финал), распознаватель ещё дописывает ту же
                         // фразу и отдаст СВОЙ финал — он уехал бы в сессию дублем. Сбрасываем сессию,
                         // как уже делает sendNow (ветка догадки впервые ожила окном 30с, и на медленном
@@ -4494,7 +4869,7 @@ class BridgeService : Service() {
                 lastVoiceTs < listenStartedAt &&
                 now - maxOf(listenStartedAt, userActionTs) > 70000
             if (neverSpoke) {
-                LogBus.add("70с молчания — микрофон спит; разбудит ответ, кнопка или тангента")
+                LogBus.add(tr("70с молчания — микрофон спит; разбудит ответ, кнопка или тангента", "70s of silence — mic asleep; a reply, button or push-to-talk will wake it"))
                 if (Cfg.whisper && recThread != null) cancelReq = true
                 sleepAfterSend()
                 main.postDelayed(this, 30000)
@@ -4510,14 +4885,14 @@ class BridgeService : Service() {
                 // ровно критический баг v0.51 (следующее сообщение сервер удалил бы молча).
                 if (!Cfg.autoSend && Cfg.whisper && recThread != null && uttSpeechMs > 0) {
                     finalizeReq = true
-                    LogBus.add("5 мин без общения — досылаю накопленное, чтобы не потерять")
+                    LogBus.add(tr("5 мин без общения — досылаю накопленное, чтобы не потерять", "5 min without activity — flushing the backlog so nothing is lost"))
                 } else {
                     // накопленное за 5 минут без диалога — фоновый мусор, не сообщение
                     if (Cfg.whisper && recThread != null) cancelReq = true
-                    cue("микрофон выключен")
+                    cue(tr("микрофон выключен", "microphone off"))
                     buzz(400)
                     stopListening()
-                    LogBus.add("диктофон уснул (5 мин без общения) — разбудит ответ или кнопка")
+                    LogBus.add(tr("диктофон уснул (5 мин без общения) — разбудит ответ или кнопка", "recorder fell asleep (5 min without activity) — a reply or button will wake it"))
                 }
             }
             // v0.47: пишем телефоном, потому что гарнитура не отдала микрофон за 8с — но она
@@ -4529,7 +4904,7 @@ class BridgeService : Service() {
                 cuePlayer == null && cueQueue.isEmpty() && cuePlayWhenReady.isEmpty()
             ) {
                 startHeadsetMic()
-                if (scoStarted) LogBus.add("гарнитура отдала микрофон — переключился на неё")
+                if (scoStarted) LogBus.add(tr("гарнитура отдала микрофон — переключился на неё", "headset gave the mic back — switched to it"))
             }
             // v0.12 (боевое «кнопки вообще перестали работать»): чужой плеер перехватывает
             // приоритет медиакнопок, а мы заявляли его только на старте озвучки/слушания.
@@ -4549,7 +4924,9 @@ class BridgeService : Service() {
         val sendRe = Regex("^([оа]т?|т)п+рав\\w*$")
         val tailFillers = setOf("пожалуйста", "сейчас", "давай", "сообщение", "это", "уже", "быстро")
         var idxSend = -1
-        if (words.isNotEmpty()) {
+        if (Lang.en) {
+            if (EN_SEND_PHRASES.contains(words.joinToString(" "))) return ""   // весь сегмент — команда
+        } else if (words.isNotEmpty()) {
             val li = words.size - 1
             if (sendRe.matches(words[li])) idxSend = li
             else if (words.size >= 2 && tailFillers.contains(words[li]) && sendRe.matches(words[li - 1])) idxSend = li - 1
@@ -4570,7 +4947,7 @@ class BridgeService : Service() {
             resetSendWindow()   // v0.46
             draft.setLength(0); lastPartial = ""   // v0.46-fix: догадка ушла вместе с мыслью — иначе fire/кнопка дошлёт её
             beepBoth(ToneGenerator.TONE_PROP_NACK, 250)
-            LogBus.add("отмена по голосу — черновик пуст")
+            LogBus.add(tr("отмена по голосу — черновик пуст", "cancelled by voice — draft is empty"))
             return
         }
 
@@ -4590,7 +4967,9 @@ class BridgeService : Service() {
             val sendRe = Regex("^([оа]т?|т)п+рав\\w*$")
             val tailFillers = setOf("пожалуйста", "сейчас", "давай", "сообщение", "это", "уже", "быстро")
             var idxSend = -1
-            if (words.isNotEmpty()) {
+            if (Lang.en) {
+                if (EN_SEND_PHRASES.contains(words.joinToString(" "))) idxSend = 0
+            } else if (words.isNotEmpty()) {
                 val li = words.size - 1
                 if (sendRe.matches(words[li])) idxSend = li
                 else if (words.size >= 2 && tailFillers.contains(words[li]) && sendRe.matches(words[li - 1])) idxSend = li - 1
@@ -4599,7 +4978,7 @@ class BridgeService : Service() {
                 cancelAutoSend()
                 resetSendWindow()   // v0.46
                 val matched = words[idxSend]
-                val cut = t.trim().let {
+                val cut = if (Lang.en) "" else t.trim().let {
                     val idx = it.lowercase().lastIndexOf(matched)
                     if (idx >= 0) it.substring(0, idx) else it
                 }.trim().trimEnd(',', '.', '!', ' ')
@@ -4607,8 +4986,8 @@ class BridgeService : Service() {
                 val msg = draft.toString().trim()
                 draft.setLength(0); lastPartial = ""   // v0.46-fix: мысль ушла — догадку не дошлём дублем
                 // v0.12: в журнале видно ПРИЧИНУ отправки — «ушло» больше не выглядит самопроизвольным
-                if (msg.isNotEmpty()) { LogBus.add("стоп-слово «$matched» — отправляю"); send(msg); sleepAfterSend() }
-                else LogBus.add("нечего отправлять")
+                if (msg.isNotEmpty()) { LogBus.add(tr("стоп-слово «$matched» — отправляю", "stop word “$matched” — sending")); send(msg); sleepAfterSend() }
+                else LogBus.add(tr("нечего отправлять", "nothing to send"))
                 return
             }
         }
@@ -4622,7 +5001,7 @@ class BridgeService : Service() {
         lastTextTs = finTs
         lastActivityTs = finTs
         draft.append(if (draft.isEmpty()) "" else " ").append(t.trim())
-        LogBus.add("черновик: …${draft.takeLast(80)}")
+        LogBus.add(tr("черновик: …${draft.takeLast(80)}", "draft: …${draft.takeLast(80)}"))
         scheduleAutoSend()   // v0.5: новый кусок в черновике — перезапустить отсчёт тишины
     }
 
@@ -4631,10 +5010,11 @@ class BridgeService : Service() {
     // до send во всех путях): один повтор через 3с, затем текст ложится в очередь unsent и
     // досылается при реконнекте. Отклонение сервером (4xx) не повторяем — это не сеть.
     private fun send(text: String, attempt: Int = 0) {
+        val sentAt = System.currentTimeMillis()
         val sid = Cfg.replyTarget.ifEmpty { lastSession ?: "" }
         val projLabel = SessionBook.all().firstOrNull { it.sid == sid }?.proj ?: lastProj
         if (sid.isEmpty()) {
-            LogBus.add("не знаю, в какую сессию отправлять (ещё не было озвучек)")
+            LogBus.add(tr("не знаю, в какую сессию отправлять (ещё не было озвучек)", "don't know which session to send to (no playback yet)"))
             return
         }
         val body = JSONObject().put("session_id", sid).put("text", text).toString()
@@ -4648,15 +5028,15 @@ class BridgeService : Service() {
                 main.post {
                     if (!alive) return@post
                     if (attempt == 0) {
-                        LogBus.add("отправка не удалась (${e.message?.take(30)}) — повтор через 3с")
+                        LogBus.add(tr("отправка не удалась (${e.message?.take(30)}) — повтор через 3с", "send failed (${e.message?.take(30)}) — retry in 3s"))
                         main.postDelayed({ if (alive) send(text, 1) }, 3000)
                         return@post
                     }
                     if (unsent.size < 10) unsent.addLast(text)
                     beepBoth(ToneGenerator.TONE_PROP_NACK, 300)
                     buzz(500)
-                    cue("не ушло, отправлю при связи")
-                    LogBus.add("отправка НЕ удалась: ${e.message} — сохранил, дошлю при связи: ${text.take(60)}")
+                    cue(tr("не ушло, отправлю при связи", "not sent, will send when back online"))
+                    LogBus.add(tr("отправка НЕ удалась: ${e.message} — сохранил, дошлю при связи: ${text.take(60)}", "send FAILED: ${e.message} — saved, will resend when connected: ${text.take(60)}"))
                     kickPlayback()   // v0.5.3: не держать очередь озвучек из-за сбоя отправки
                 }
             }
@@ -4682,10 +5062,10 @@ class BridgeService : Service() {
                         // v0.37: unread от релея = очередь сессии никто не читает — честно сказать
                         val unread = try { JSONObject(respBody ?: "{}").optBoolean("unread") } catch (_: Exception) { false }
                         if (unread) {
-                            LogBus.add("ВНИМАНИЕ: «${projLabel ?: sid.take(8)}» не забирает сообщения — сессия закрыта или приёмник умер. Текст ждёт в очереди")
+                            LogBus.add(tr("ВНИМАНИЕ: «${projLabel ?: sid.take(8)}» не забирает сообщения — сессия закрыта или приёмник умер. Текст ждёт в очереди", "WARNING: “${projLabel ?: sid.take(8)}” is not picking up messages — session closed or receiver died. Text waits in the queue"))
                             if (System.currentTimeMillis() - lastUnreadCueTs > 10000) {
                                 lastUnreadCueTs = System.currentTimeMillis()
-                                cue("канал не слушает")
+                                cue(tr("канал не слушает", "channel is not listening"))
                                 suppressListenCueUntil = System.currentTimeMillis() + 8000   // v0.82
                             }
                             buzz(400)
@@ -4704,17 +5084,19 @@ class BridgeService : Service() {
                             if (Build.VERSION.SDK_INT >= 26) vib?.vibrate(android.os.VibrationEffect.createOneShot(180, 200))
                             else @Suppress("DEPRECATION") vib?.vibrate(180)
                         } catch (_: Exception) {}
-                        LogBus.add("отправлено в «${projLabel ?: "?"}»: ${text.take(60)}")
+                        LogBus.add(tr("отправлено в «${projLabel ?: "?"}»: ${text.take(60)}", "sent to “${projLabel ?: "?"}”: ${text.take(60)}"))
                         // v0.69: эхо для ленты-чата — сам движок не меняется (см. Feed.kt)
                         answeredCurrent = true   // v0.81
-                        manualPinTs = 0L         // v0.85: ручной выбор действовал на это сообщение
+                        // v0.85: ручной выбор действовал на это сообщение (v1.16-fix: если оно ушло
+                        // в него и отправлено после выбора)
+                        if (sid == Cfg.replyTarget && sentAt >= manualPinTs) manualPinTs = 0L
                         lastSendOkTs = System.currentTimeMillis()   // v0.90
                         awaitSendCueUntil = 0L                      // v1.08
                         Feed.userSent(this@BridgeService, sid, text, unread)
                         applyPendingTarget()   // v0.78: отложенное переключение адресата
                     } else {
                         beepBoth(ToneGenerator.TONE_PROP_NACK, 300)
-                        LogBus.add("отправка ОТКЛОНЕНА ($code): ${err ?: "?"} — текст: ${text.take(60)}")
+                        LogBus.add(tr("отправка ОТКЛОНЕНА ($code): ${err ?: "?"} — текст: ${text.take(60)}", "send REJECTED ($code): ${err ?: "?"} — text: ${text.take(60)}"))
                     }
                     kickPlayback()   // v0.5.3: отправка ушла — выпустить отложенный ответ из очереди
                 }

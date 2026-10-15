@@ -30,8 +30,8 @@ android {
         targetSdk = 35
         // Single source of truth for the version: the app reads BuildConfig.VERSION_NAME.
         // Bump BOTH on every delivered build (Play requires a growing versionCode).
-        versionCode = 115
-        versionName = "1.15"
+        versionCode = 141
+        versionName = "1.41"
     }
 
     // Two builds from one codebase. "personal" is the owner's build: his relay baked in
@@ -49,6 +49,8 @@ android {
             buildConfigField("String", "DEF_PIN", "\"${localProps.getProperty("relayPin", "")}\"")
             // The owner runs whisper.cpp on his relay — server-side recognition is his default.
             buildConfigField("boolean", "DEF_WHISPER", "true")
+            buildConfigField("boolean", "DEF_HANDSFREE", "false")
+            buildConfigField("boolean", "DEF_AUTOSEND", "true")
         }
         create("store") {
             dimension = "dist"
@@ -59,6 +61,8 @@ android {
             // silently. Android's recognizer works out of the box and keeps the headset
             // button usable; whisper stays an opt-in in the advanced section.
             buildConfigField("boolean", "DEF_WHISPER", "false")
+            buildConfigField("boolean", "DEF_HANDSFREE", "false")
+            buildConfigField("boolean", "DEF_AUTOSEND", "true")
         }
     }
 
@@ -93,11 +97,18 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
 }
 
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.media:media:1.7.0")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.16")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
     // org.json comes with the Android platform itself — no Maven copy needed
 }
