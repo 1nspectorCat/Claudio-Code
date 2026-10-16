@@ -30,8 +30,8 @@ android {
         targetSdk = 35
         // Single source of truth for the version: the app reads BuildConfig.VERSION_NAME.
         // Bump BOTH on every delivered build (Play requires a growing versionCode).
-        versionCode = 141
-        versionName = "1.41"
+        versionCode = 148
+        versionName = "1.48"
     }
 
     // Two builds from one codebase. "personal" is the owner's build: his relay baked in
@@ -51,6 +51,18 @@ android {
             buildConfigField("boolean", "DEF_WHISPER", "true")
             buildConfigField("boolean", "DEF_HANDSFREE", "false")
             buildConfigField("boolean", "DEF_AUTOSEND", "true")
+        }
+        // Hub test build: the owner's relay like "personal", but a separate app (own package,
+        // own settings, own name) that installs NEXT TO his working walkie-talkie, not over it.
+        create("hubtest") {
+            dimension = "dist"
+            applicationIdSuffix = ".hubtest"
+            versionNameSuffix = "-hub"
+            buildConfigField("String", "DEF_URL", "\"${localProps.getProperty("relayUrl", "")}\"")
+            buildConfigField("String", "DEF_PIN", "\"${localProps.getProperty("relayPin", "")}\"")
+            buildConfigField("boolean", "DEF_WHISPER", "true")
+            buildConfigField("boolean", "DEF_HANDSFREE", "true")
+            buildConfigField("boolean", "DEF_AUTOSEND", "false")
         }
         create("store") {
             dimension = "dist"

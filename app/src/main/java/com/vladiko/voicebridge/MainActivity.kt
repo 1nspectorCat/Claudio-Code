@@ -114,6 +114,11 @@ class MainActivity : AppCompatActivity() {
 
     // ── состояние ленты ──
     private var feedSid = ""
+    // v1.43 (слово юзера 16.10: «ходить по сессиям в интерфейсе не должно переключать, куда
+    // уйдёт мой ответ»). Канал, открытый в ленте ТАПОМ ПО СТРОКЕ, — это чтение, не выбор
+    // адресата. Пусто = лента идёт за адресатом, как раньше.
+    private var viewSid = ""
+    private var lastTargetEpoch = -1   // v1.44: явная смена адресата в движке снимает viewSid
     private var feedBusy = false
     private var lastFeedFetch = 0L
     // сентинел, а не "": sig ПУСТОЙ ленты — тоже пустая строка, и равенство съедало
@@ -133,9 +138,68 @@ class MainActivity : AppCompatActivity() {
     private var sheetShowAll = false
     private var sheetEditMode = false                       // v1.09: правка списка галочками
     private val serverSids = LinkedHashMap<String, String>() // sid -> имя, всё что знает релей
-    private var sheetMode = "channels"   // чем занята шторка: "channels" | "held" | "models" | "hubch"
+    private var sheetMode = "channels"   // чем занята шторка: "channels" | "held" | "hubch" | "hubdet" | "models" | "conn" | "money"
+    private var hubCreateOpen = false     // v1.44: форма «новый канал» свёрнута, пока не нажат «+ новый канал»
+    private var hubHealthSub: TextView? = null  // v1.44: подпись строки «хаб · каналы», обновляется на месте
+    private var lastModelsAskTs = 0L
+    private var firstModelsAskTs = 0L   // v1.44: «проверяю хаб…» только на первые 15с, потом честное «молчит»
     // экран «сессии хаба»: каналы создаёт и удаляет хаб по JSON-команде в служебный канал
-    private val hubControlSid = "hub-control"
+    // ноутбук — "hub-l-" с дефисом: ручные серверные hub-lab/hub-landing не его; списки каналов хабов главнее префикса
+    private fun hubOf(sid: String) = when {
+        sid == "hub-control-laptop" -> "laptop"
+        hubHasChannel("laptop", sid) -> "laptop"
+        hubHasChannel("server", sid) -> "server"
+        sid.startsWith("hub-l-") -> "laptop"
+        else -> "server"
+    }
+    private fun hubHasChannel(hub: String, sid: String): Boolean {
+        val chans = hubStates[hub]?.optJSONArray("channels") ?: return false
+        for (i in 0 until chans.length()) if (chans.optJSONObject(i)?.optString("id") == sid) return true
+        return false
+    }
+    private fun defaultMaxChannels(hub: String) = if (hub == "laptop") 20 else 10
+    private fun hubControlSid(hub: String) = if (hub == "laptop") "hub-control-laptop" else "hub-control"
+    private fun isHubControl(sid: String) = sid == "hub-control" || sid == "hub-control-laptop"
+    private var detailsHub = "server"
+    private var createHub = "server"
+    private var hubReqHub = "server"
+    private val hubStates = HashMap<String, JSONObject>()
+    private val hubStateTs = HashMap<String, Long>()
+    private var laptopSeen = false
+    private fun laptopFresh() = hubStates["laptop"] != null &&
+        System.currentTimeMillis() - (hubStateTs["laptop"] ?: 0L) <= 600_000L
+    private fun laptopOfflineNote() = if (!laptopFresh() && (laptopSeen || serverSids.keys.any { hubOf(it) == "laptop" }))
+        tr("ноутбук не в сети", "laptop offline") else ""
+    private fun detailState() = hubStates[detailsHub]
+
+    private fun addHubChoice(selected: String, choose: (String) -> Unit) {
+        if (!laptopFresh()) return
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for (hub in listOf("server", "laptop")) {
+            row.addView(smallBtn((if (hub == selected) "● " else "○ ") +
+                (if (hub == "server") tr("сервер", "server") else tr("ноутбук", "laptop")), cAccSoft) {
+                if (hub != selected) choose(hub)
+            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        }
+        sheetList.addView(row)
+    }
+
+    private fun addDetailsHubChoice() {
+        if (!laptopFresh() && detailsHub == "laptop") {
+            sheetList.addView(tv(tr("ноутбук не в сети", "laptop offline"), 12f, cFaint))
+            sheetList.addView(smallBtn(tr("сервер", "server"), cAccSoft) { selectDetailsHub("server") })
+        }
+        addHubChoice(detailsHub) { hub -> selectDetailsHub(hub) }
+    }
+
+    private fun selectDetailsHub(hub: String) {
+        detailsHub = hub
+        hubKeyProvider = ""; hubKeyReplace = false
+        hubKeyEdit?.setText(""); hubCodeEdit?.setText("")
+        hubNfClientIdEdit?.setText(""); hubNfClientSecretEdit?.setText(""); hubNfWorkspaceEdit?.setText("")
+        planEditSub = ""; planPriceEdit?.setText(""); planEndsEdit?.setText("")
+        renderHub()
+    }
     private var hubReq = ""              // req последней команды; итог хаб кладёт в /hubstate
     private var hubReqCmd = ""
     private var hubReqArg = ""           // имя создаваемого канала или id удаляемого
@@ -248,6 +312,7 @@ class MainActivity : AppCompatActivity() {
             fileTargetSid = state.getString("fileTargetSid").orEmpty()
             fileTargetName = state.getString("fileTargetName").orEmpty()
             feedSid = state.getString("feedSid").orEmpty()
+            viewSid = state.getString("viewSid").orEmpty()
             hubReq = state.getString("hubReq").orEmpty()
             hubReqCmd = state.getString("hubReqCmd").orEmpty()
             hubReqArg = state.getString("hubReqArg").orEmpty()
@@ -315,6 +380,7 @@ class MainActivity : AppCompatActivity() {
         outState.putString("fileTargetSid", fileTargetSid)
         outState.putString("fileTargetName", fileTargetName)
         outState.putString("feedSid", feedSid)
+        outState.putString("viewSid", viewSid)
         outState.putString("textDraft", textEdit.text.toString())
         outState.putString("hubReq", hubReq)
         outState.putString("hubReqCmd", hubReqCmd)
@@ -657,6 +723,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(10), dp(6), dp(10), dp(6))
             contentDescription = tr("отправить файл в открытый канал хаба", "send a file to the open hub channel")
             setOnClickListener { pickFileForChannel() }
+            if (BuildConfig.FLAVOR == "store") visibility = View.GONE
         }
         val textRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -763,7 +830,7 @@ class MainActivity : AppCompatActivity() {
     private fun pickFileForChannel() {
         if (Cfg.token.isEmpty() || Cfg.url.isEmpty()) { onboardOverlay.visibility = View.VISIBLE; return }
         val sid = feedSid.ifEmpty { currentSid() }
-        if (!sid.startsWith("hub-") || sid == hubControlSid) {
+        if (!sid.startsWith("hub-") || isHubControl(sid)) {
             showTextStatus(tr("файл можно отправить только в канал хаба: открой его в ленте", "a file can only go to a hub channel: open it in the feed"), cPlay)
             return
         }
@@ -942,9 +1009,28 @@ class MainActivity : AppCompatActivity() {
         val running = svc != null && BridgeService.running
         val st = if (!running) "" else svc!!.statusText()
 
+        // v1.44 (ревью v1.43): адресат сменили голосом / «ответом в крайнюю» — лента идёт за ним,
+        // иначе на экране остаётся прочитанный канал, а голос уходит в другой
+        if (running) {
+            val ep = svc!!.targetEpoch
+            if (lastTargetEpoch >= 0 && ep != lastTargetEpoch && viewSid.isNotEmpty()) {
+                viewSid = ""
+                refreshFeed(true)
+            }
+            lastTargetEpoch = ep
+        }
+
         // канал-чип
         val name = if (running) svc!!.replyTargetName() else feedName()
-        chipBtn.text = "▾ " + name + (if (Cfg.pickedSids.isNotEmpty()) "  ·  " + Cfg.pickedSids.split(",").count { it.isNotBlank() } + tr(" в работе", " active") else "")
+        // v1.43: читаю не тот канал, куда уйдёт голос — сказать это прямо на чипе
+        val tgtSid = if (running) svc!!.replyTargetSid() else Cfg.replyTarget
+        val viewing = if (viewSid.isNotEmpty() && viewSid != tgtSid && !SessionBook.isForgotten(this, viewSid))
+            tr("  ·  смотрю ", "  ·  viewing ") + feedName() else ""
+        // v1.44 (ревью v1.43): набранное уходит в канал ленты, голос — адресату. Подсказка
+        // поля называет, куда уйдёт текст, чтобы расхождение было видно до отправки
+        val hintNow = tr("в «", "to “") + feedName() + tr("»: написать…", "”: type…")
+        if (textEdit.hint?.toString() != hintNow) textEdit.hint = hintNow
+        chipBtn.text = "▾ " + name + viewing + (if (Cfg.pickedSids.isNotEmpty()) "  ·  " + Cfg.pickedSids.split(",").count { it.isNotBlank() } + tr(" в работе", " active") else "")
 
         // микрофон-мьют в шапке
         val muted = running && svc!!.isMicMuted()
@@ -1081,6 +1167,9 @@ class MainActivity : AppCompatActivity() {
     // Только sid, никогда имя: у юзера документированно живут четыре «playbook» разом,
     // обратный поиск по имени показывал бы чужой разговор (ревью v0.69).
     private fun currentSid(): String {
+        // v1.43: открытый для чтения канал главнее адресата — но только для ЛЕНТЫ; куда уйдёт
+        // голос, решает движок (replyTargetSid), и этот выбор его не трогает
+        if (viewSid.isNotEmpty() && !SessionBook.isForgotten(this, viewSid)) return viewSid
         // v0.85 (боевое: «отправил в voicebridge, а в ленте не появилось»): адресат ВСЕГДА
         // главнее набора. Набор — про то, кого слышу; лента должна показывать тот разговор,
         // в который реально уходит твоя реплика, иначе пузырь «ушло» падает в чужую ленту.
@@ -1427,7 +1516,9 @@ class MainActivity : AppCompatActivity() {
         if (items.isEmpty()) { LogBus.add(tr("у сообщения нет аудио", "this message has no audio")); return }
         LogBus.add(if (fromHere) tr("лента: играю с выбранного места (${items.size} ч.)", "feed: playing from the chosen spot (${items.size} parts)") else tr("лента: играю сообщение", "feed: playing the message"))
         // явное «слушать» с экрана: микрофон вниз, иначе этикет отложит озвучку (v0.73)
-        ensureService { it.listenIntent(); it.playFrom(sid, proj, items) }
+        // v1.43: текст выбранного — на случай, если звук на релее уже удалён (прочтёт вместо него)
+        val text = chosen.joinToString(" ") { mm -> mm.texts.sortedBy { it.first }.joinToString(" ") { it.second } }
+        ensureService { it.listenIntent(); it.playFrom(sid, proj, items, text) }
     }
 
     // ── шторка «каналы» ──────────────────────────────────────────────────
@@ -1575,7 +1666,7 @@ class MainActivity : AppCompatActivity() {
                     val arr = JSONObject(raw).optJSONArray("sessions")
                     if (arr != null) for (i in 0 until arr.length()) {
                         val o = arr.getJSONObject(i)
-                        if (o.optString("sid") == hubControlSid) continue
+                        if (isHubControl(o.optString("sid"))) continue
                         if (o.optInt("count") == 0) noHistory.add(o.getString("sid"))
                         parsed.add(Triple(o.getString("sid"), o.optString("proj"), o.optLong("lastTs")))
                         serverSids[o.getString("sid")] = o.optString("proj")
@@ -1622,18 +1713,18 @@ class MainActivity : AppCompatActivity() {
         ))
         // Hub screens need the owner's hub server, which is not public yet: hidden in the store build.
         if (!sheetEditMode && BuildConfig.FLAVOR != "store") {
-            sheetList.addView(linkRow(tr("модели и лимиты", "models and limits"), tr("какие нейросети подключены к хабу, кто ведущий, лимиты", "which AIs are connected to the hub, who leads, limits")) {
-                openModels()
-            })
-            sheetList.addView(linkRow(tr("сессии хаба", "hub sessions"), tr("каналы хаба: создать с проектом, удалить", "hub channels: create with a project, delete")) {
-                openHubChannels()
-            })
-            sheetList.addView(linkRow(tr("подключения", "connections"), tr("ключи API и вход в подписки для хаба", "API keys and subscription sign-in for the hub")) {
-                openConnections()
-            })
-            sheetList.addView(linkRow(tr("расходы", "costs"), tr("хватает ли связки подписок: деньги, лимиты, объём, качество", "is the subscription bundle enough: money, limits, volume, quality")) {
-                openMoney()
-            })
+            // v1.44: одна строка хаба вместо четырёх; цифры — за «подробности»
+            // шторка перестраивается каждые 5с: состояние есть — спрашиваем раз в минуту, нет — раз в 15с
+            val askAge = System.currentTimeMillis() - lastModelsAskTs
+            if (askAge > (if (lastModels == null) 15000L else 60000L)) {
+                lastModelsAskTs = System.currentTimeMillis()
+                if (firstModelsAskTs == 0L) firstModelsAskTs = lastModelsAskTs
+                fetchModels()
+            }
+            val (hSub, hCol) = hubHealthLine(lastModels)
+            val hubRow = linkRow(tr("хаб · каналы", "hub · channels"), hSub) { openHubChannels() }
+            hubHealthSub = ((hubRow.getChildAt(0) as? LinearLayout)?.getChildAt(1) as? TextView)?.also { it.setTextColor(hCol) }
+            sheetList.addView(hubRow)
             sheetList.addView(divider(), LinearLayout.LayoutParams(MATCH_PARENT, 1))
         }
         val list = SessionBook.all()
@@ -1710,7 +1801,8 @@ class MainActivity : AppCompatActivity() {
             val unheard = e.lastTs > prefs.getLong("heard_${e.sid}", 0L)
             // имя — главное на строке: крупнее, во всю ширину, метки минимальные
             val nm = tv(
-                (if (unheard) "● " else "") + e.proj.ifEmpty { e.sid.take(8) },
+                (if (unheard) "● " else "") + e.proj.ifEmpty { e.sid.take(8) } +
+                    (if (hubOf(e.sid) == "laptop") tr(" · ноутбук", " · laptop") else ""),
                 15f, if (unheard) cText else cDim
             ).apply {
                 maxLines = 1
@@ -1737,6 +1829,7 @@ class MainActivity : AppCompatActivity() {
                 contentDescription = tr("отвечать в этот канал прямо сейчас", "reply to this channel right now")
                 setOnClickListener {
                     sheetOverlay.visibility = View.GONE
+                    viewSid = e.sid   // v1.43: отвечаю туда — туда и смотрю
                     ensureService { it.replyToSession(e.sid) }
                     refreshFeed(true)
                 }
@@ -1781,16 +1874,18 @@ class MainActivity : AppCompatActivity() {
             row.orientation = LinearLayout.VERTICAL
             row.addView(line1, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             row.addView(line2, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
-            // тап по строке = ответить в этот канал (на одно сообщение)
+            // v1.43 (решение юзера 16.10, отменяет v1.18 «выбор на экране главнее последнего
+            // говорившего»): тап по строке = ОТКРЫТЬ канал в ленте и только. Адресат и ручное
+            // закрепление не трогаются; сменить адресата можно одним жестом — «ответить».
+            // Тап по строке канала, который и так адресат, возвращает ленту за адресатом.
             row.setOnClickListener {
-                run {
-                    // v0.78: через защищённую точку — начатая диктовка уедет СТАРОМУ адресату
-                    val svc = BridgeService.instance
-                    if (svc != null && BridgeService.running) svc.setReplyTargetManual(e.sid)
-                    else { Cfg.replyTarget = e.sid; Cfg.save(this@MainActivity) }
-                    BridgeService.instance?.onReplyTargetPicked()   // штамп ручного выбора
-                    LogBus.add(tr("отвечаю теперь в «${e.proj.ifEmpty { e.sid.take(8) }}»", "now replying in “${e.proj.ifEmpty { e.sid.take(8) }}”"))
-                }
+                val tgt = BridgeService.instance?.takeIf { BridgeService.running }?.replyTargetSid() ?: Cfg.replyTarget
+                val nm0 = e.proj.ifEmpty { e.sid.take(8) }
+                viewSid = if (e.sid == tgt) "" else e.sid
+                LogBus.add(
+                    if (viewSid.isEmpty()) tr("смотрю «$nm0» — туда же уйдёт ответ", "viewing “$nm0” — replies go there too")
+                    else tr("смотрю «$nm0»; ответ уйдёт по-прежнему адресату — сменить: «ответить»", "viewing “$nm0”; replies still go to the target — to change: “reply”")
+                )
                 sheetOverlay.visibility = View.GONE
                 refreshFeed(true)
             }
@@ -1824,8 +1919,8 @@ class MainActivity : AppCompatActivity() {
         sheetList.addView(allRow)
         sheetList.addView(tv(
             tr("«в работу» — кого слышу (можно несколько каналов)\n", "“active” — whom I hear (several channels allowed)\n") +
-                tr("отвечаю всегда тому, кто говорил последним · «ответить» — сказать ЭТОМУ,\n", "I always reply to whoever spoke last · “reply” — say it to THIS one,\n") +
-                tr("на одно сообщение · долгий тап по строке — убрать канал из списка", "for one message · long press on a row — remove channel from list"),
+                tr("тап по строке — только посмотреть ленту, адресат не меняется\n", "tap a row — just view its feed, the target stays\n") +
+                tr("«ответить» — говорить ЭТОМУ каналу · долгий тап — убрать из списка", "“reply” — talk to THIS channel · long press — remove from list"),
             9.5f, cFaint
         ).apply {
             setPadding(dp(4), dp(4), dp(4), 0)
@@ -1853,7 +1948,9 @@ class MainActivity : AppCompatActivity() {
         hubCommandStatus(st)?.let { (text, col) ->
             sheetList.addView(tv(text, 12.5f, col).apply { setPadding(dp(2), 0, dp(2), dp(8)) })
         }
-        if (st == null) {
+        if (st == null && hubStates["laptop"] == null) {
+            val offline = laptopOfflineNote()
+            if (offline.isNotEmpty()) sheetList.addView(tv(offline, 12f, cFaint))
             sheetList.addView(tv(
                 if (loading) tr("запрашиваю состояние хаба…", "asking for hub state…")
                 else tr("хаб не прислал состояние: хаб не запущен или релей ещё не знает /hubstate", "hub sent no state: the hub is not running or the relay does not know /hubstate yet"),
@@ -1861,15 +1958,98 @@ class MainActivity : AppCompatActivity() {
             ).apply { setPadding(dp(2), dp(10), dp(2), dp(10)) })
             return
         }
-        val labels = HashMap<String, String>()
-        st.optJSONArray("agents")?.let { ag ->
+        // v1.44: одна ясная строка «что не так» вместо россыпи цифр
+        val probs = allHubProblems()
+        val offline = laptopOfflineNote()
+        if (offline.isNotEmpty()) sheetList.addView(tv(offline, 12f, cFaint))
+        if (probs.isEmpty()) {
+            sheetList.addView(tv(tr("всё в строю", "all good"), 13f, cPlay).apply { setPadding(dp(2), 0, dp(2), dp(8)) })
+        } else {
+            for (line in probs.take(3)) sheetList.addView(tv(line, 13f, 0xFFC9483C.toInt()).apply { setPadding(dp(2), 0, dp(2), dp(2)) })
+            if (probs.size > 3) sheetList.addView(tv(tr("и ещё ${probs.size - 3}", "and ${probs.size - 3} more"), 11f, cFaint).apply { setPadding(dp(2), 0, dp(2), dp(2)) })
+        }
+        val limitBad = ArrayList<String>()
+        st?.optJSONArray("agents")?.let { ag ->
             for (i in 0 until ag.length()) {
                 val a = ag.optJSONObject(i) ?: continue
-                labels[a.optString("name")] = a.optString("label", a.optString("name"))
+                if (jstr(a, "limit_error").isNotEmpty()) limitBad.add(jstr(a, "label").ifEmpty { jstr(a, "name") })
             }
         }
+        if (limitBad.isNotEmpty()) {
+            sheetList.addView(tv(tr("лимит не читается: ", "limit not readable: ") + limitBad.joinToString(", "), 11.5f, cFaint).apply {
+                setPadding(dp(2), 0, dp(2), dp(4))
+            })
+        }
+        for (hub in listOf("server", "laptop")) {
+            val state = hubStates[hub] ?: continue
+            val labels = HashMap<String, String>()
+            state.optJSONArray("agents")?.let { ag ->
+                for (i in 0 until ag.length()) {
+                    val a = ag.optJSONObject(i) ?: continue
+                    labels[a.optString("name")] = a.optString("label", a.optString("name"))
+                }
+            }
+            loadHubAllowOptions(state)
+            val chans = state.optJSONArray("channels")
+            val n = chans?.length() ?: 0
+            val room = state.optInt("max_channels", defaultMaxChannels(hub)) - 1
+            val hubLabel = if (hub == "server") tr("сервер", "server") else tr("ноутбук", "laptop")
+            sheetList.addView(tv("$hubLabel · " + tr("$n из $room", "$n of $room"), 11f, cDim, bold = true).apply {
+                setPadding(dp(2), 0, 0, dp(4))
+            })
+            if (chans != null) for (i in 0 until chans.length()) {
+                val item = chans.optJSONObject(i) ?: continue
+                if (isHubControl(jstr(item, "id"))) continue
+                sheetList.addView(hubChannelCard(item, labels),
+                    LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(8) })
+            }
+        }
+        // v1.44: создание свёрнуто за строкой-переключателем
+        sheetList.addView(tv((if (hubCreateOpen) "▾ " else "") + tr("+ новый канал", "+ new channel"), 13f, cAccSoft).apply {
+            setPadding(dp(2), dp(10), dp(2), dp(10))
+            setOnClickListener {
+                hubCreateOpen = !hubCreateOpen
+                // свёрнутое поле с фокусом держало бы hubTyping() и морозило перерисовку экрана
+                if (!hubCreateOpen) { hubNameEdit?.let { hideKeyboard(it) }; hubNameEdit?.clearFocus(); hubGitEdit?.clearFocus() }
+                renderHubChannels(lastModels)
+            }
+        })
+        if (hubCreateOpen) {
+            if (!laptopFresh() && createHub == "laptop") {
+                createHub = "server"; hubProject = ""; hubFolder = ""; hubAllowNew.clear()
+                hubGitEdit?.setText("")
+            }
+            addHubChoice(createHub) { hub ->
+                createHub = hub; hubProject = ""; hubFolder = ""; hubAllowNew.clear()
+                hubGitEdit?.setText(""); renderHub()
+            }
+            val createState = hubStates[createHub]
+            loadHubAllowOptions(createState)
+            val projects = createState?.optJSONArray("projects")
+            val n = createState?.optJSONArray("channels")?.length() ?: 0
+            val room = (createState?.optInt("max_channels", defaultMaxChannels(createHub)) ?: defaultMaxChannels(createHub)) - 1
+            when {
+                n >= room -> sheetList.addView(tv(
+                    tr("больше каналов релей не пропустит: удали ненужный, чтобы создать новый", "the relay will not allow more channels: delete an unused one to create a new one"), 12f, cFaint))
+                projects == null || projects.length() == 0 -> sheetList.addView(tv(
+                    tr("в настройках хаба нет списка проектов (projects)", "no project list (projects) in hub settings"), 12f, cFaint))
+                else -> addHubCreateForm(projects, createState?.optJSONArray("folders"))
+            }
+            sheetList.addView(tv(
+                tr("канал из настроек хаба удаляется только на сервере · при удалении сессии агентов ", "a channel from hub settings is deleted only on the server · when a session is deleted, agents ") +
+                    tr("уходят в архив, папка проекта остаётся", "go to the archive, the project folder stays"),
+                9.5f, cFaint
+            ).apply { setPadding(dp(4), dp(8), dp(4), 0) })
+        }
+        sheetList.addView(divider(), LinearLayout.LayoutParams(MATCH_PARENT, 1))
+        sheetList.addView(linkRow(tr("подробности", "details"), tr("модели и лимиты · подключения · расходы", "models and limits · connections · costs")) {
+            openHubDetails()
+        })
+    }
+
+    private fun loadHubAllowOptions(st: JSONObject?) {
         hubAllowOpts.clear()
-        st.optJSONArray("allow_options")?.let { arr ->
+        st?.optJSONArray("allow_options")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONArray(i) ?: continue
                 val mark = (if (o.optBoolean(2)) tr(" · ключ, твои деньги", " · key, your money") else "") +
@@ -1877,31 +2057,6 @@ class MainActivity : AppCompatActivity() {
                 hubAllowOpts.add(o.optString(0) to (o.optString(1).ifEmpty { o.optString(0) } + mark))
             }
         }
-        val chans = st.optJSONArray("channels")
-        val n = chans?.length() ?: 0
-        val room = st.optInt("max_channels", 10) - 1   // один из десяти — служебный канал хаба
-        sheetList.addView(tv(tr("каналы хаба · $n из $room", "hub channels · $n of $room"), 11f, cDim, bold = true).apply {
-            setPadding(dp(2), 0, 0, dp(4))
-        })
-        if (chans != null) for (i in 0 until chans.length()) {
-            val item = chans.optJSONObject(i) ?: continue
-            sheetList.addView(hubChannelCard(item, labels),
-                LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(8) })
-        }
-        sheetList.addView(tv(tr("новый канал", "new channel"), 11f, cDim, bold = true).apply { setPadding(dp(2), dp(6), 0, dp(4)) })
-        val projects = st.optJSONArray("projects")
-        when {
-            n >= room -> sheetList.addView(tv(
-                tr("больше каналов релей не пропустит: удали ненужный, чтобы создать новый", "the relay will not allow more channels: delete an unused one to create a new one"), 12f, cFaint))
-            projects == null || projects.length() == 0 -> sheetList.addView(tv(
-                tr("в настройках хаба нет списка проектов (projects)", "no project list (projects) in hub settings"), 12f, cFaint))
-            else -> addHubCreateForm(projects, st.optJSONArray("folders"))
-        }
-        sheetList.addView(tv(
-            tr("канал из настроек хаба удаляется только на сервере · при удалении сессии агентов ", "a channel from hub settings is deleted only on the server · when a session is deleted, agents ") +
-                tr("уходят в архив, папка проекта остаётся", "go to the archive, the project folder stays"),
-            9.5f, cFaint
-        ).apply { setPadding(dp(4), dp(8), dp(4), 0) })
     }
 
     private fun hubChannelCard(c: JSONObject, labels: Map<String, String>): LinearLayout {
@@ -1916,7 +2071,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        head.addView(tv(name, 14f, cText, bold = true).apply {
+        head.addView(tv(name + (if (hubOf(id) == "laptop") tr(" · ноутбук", " · laptop") else ""), 14f, cText, bold = true).apply {
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -1924,17 +2079,18 @@ class MainActivity : AppCompatActivity() {
         card.addView(head)
         val lead = jstr(c, "lead")
         val last = c.optLong("last_activity", 0L) * 1000L
+        // v1.44: одна строка состояния: ведущий · активность · закреплён
+        val pinned = jstr(c, "pinned")
+        val since = c.optLong("pinned_since", 0L) * 1000L
+        val pinText = if (pinned.isNotEmpty())
+            " · " + tr("закреплён ${labels[pinned] ?: pinned}", "pinned ${labels[pinned] ?: pinned}") +
+                (if (since > 0) tr(" с ${hhmm(since)}", " since ${hhmm(since)}") else "")
+        else ""
         card.addView(tv(
             tr("ведущий: ", "lead: ") + (labels[lead] ?: lead.ifEmpty { "—" }) +
-                " · " + (if (last > 0) tr("активность ${timeAgo(last)}", "active ${timeAgo(last)}") else tr("ещё не работал", "not worked yet")),
-            11f, cDim
+                " · " + (if (last > 0) tr("активность ${timeAgo(last)}", "active ${timeAgo(last)}") else tr("ещё не работал", "not worked yet")) + pinText,
+            11f, if (pinned.isNotEmpty()) cPlay else cDim
         ).apply { setPadding(0, dp(3), 0, 0) })
-        val pinned = jstr(c, "pinned")
-        if (pinned.isNotEmpty()) {
-            val since = c.optLong("pinned_since", 0L) * 1000L
-            card.addView(tv(tr("закреплён ${labels[pinned] ?: pinned}", "pinned ${labels[pinned] ?: pinned}") + (if (since > 0) tr(" с ${hhmm(since)}", " since ${hhmm(since)}") else "") +
-                tr(" · «сам выбирай» снимет", " · “choose yourself” unpins"), 11f, cPlay).apply { setPadding(0, dp(3), 0, 0) })
-        }
         val btns = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1946,10 +2102,12 @@ class MainActivity : AppCompatActivity() {
             contentDescription = tr("отвечать в этот канал", "reply to this channel")
             setOnClickListener {
                 SessionBook.seen(this@MainActivity, id, name, if (last > 0) last else System.currentTimeMillis())
+                // v1.43: «ответить» — единственный жест смены адресата; лента идёт туда же.
+                // Штамп закрепления ставит applyTarget (и отложенная смена — по подтверждению)
+                viewSid = id
                 val svc = BridgeService.instance
                 if (svc != null && BridgeService.running) svc.setReplyTargetManual(id)
                 else { Cfg.replyTarget = id; Cfg.save(this@MainActivity) }
-                BridgeService.instance?.onReplyTargetPicked()
                 LogBus.add(tr("отвечаю теперь в «$name»", "now replying in “$name”"))
                 sheetOverlay.visibility = View.GONE
                 refreshFeed(true)
@@ -1981,9 +2139,12 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = dp(10) })
         }
         val allow = c.optJSONArray("allow")
-        card.addView(tv(tr("доступ: ", "access: ") + allowText(allow), 11f, if (allow == null) cDim else cPlay).apply {
-            setPadding(0, dp(3), 0, 0)
-        }, 2)
+        // v1.44: строку «доступ» показываем только при ограничении (null/пусто = все подписки)
+        if (allow != null && allow.length() > 0) {
+            card.addView(tv(tr("доступ: ", "access: ") + allowText(allow), 11f, cPlay).apply {
+                setPadding(0, dp(3), 0, 0)
+            }, 2)
+        }
         card.addView(btns)
         if (hubAllowEditId == id) {
             card.addView(allowChips(hubAllowDraft), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
@@ -2196,6 +2357,18 @@ class MainActivity : AppCompatActivity() {
         if (Cfg.token.isEmpty() || Cfg.url.isEmpty()) { onboardOverlay.visibility = View.VISIBLE; return false }
         if (hubBusy()) return false
         val req = java.util.UUID.randomUUID().toString()
+        val hub = when {
+            kind == "channel.create" -> createHub
+            kind == "channel.delete" || kind == "channel.update" -> hubOf(cmd.optString("id"))
+            else -> detailsHub
+        }
+        // команда в спящий ноутбук пролежала бы в очереди и сработала бы внезапно потом
+        if (hub == "laptop" && !laptopFresh()) {
+            android.widget.Toast.makeText(this, tr("ноутбук не в сети", "laptop offline"), android.widget.Toast.LENGTH_SHORT).show()
+            return false
+        }
+        hubReqHub = hub
+        if (secret) cmd.put("hub", hub)
         cmd.put("req", req)
         hubReq = req; hubReqCmd = kind; hubReqArg = arg; hubReqText = what; hubReqWaitMs = waitMs
         hubReqTs = System.currentTimeMillis(); hubReqDone = false; hubReqError = ""
@@ -2209,7 +2382,7 @@ class MainActivity : AppCompatActivity() {
         }
         // без приставки «(набрано текстом)»: это команда хабу, не реплика
         val payload = if (secret) cmd.toString()
-            else JSONObject().put("session_id", hubControlSid).put("text", cmd.toString()).toString()
+            else JSONObject().put("session_id", hubControlSid(hub)).put("text", cmd.toString()).toString()
         val body = payload.toRequestBody("application/json; charset=utf-8".toMediaType())
         val path = if (secret) "hubsecret" else "say"
         val call = try {
@@ -2246,7 +2419,7 @@ class MainActivity : AppCompatActivity() {
         if (hubReq.isEmpty()) return null
         val red = 0xFFC9483C.toInt()
         if (hubReqError.isNotEmpty()) return tr("$hubReqText — не ушло: $hubReqError", "$hubReqText — not sent: $hubReqError") to red
-        val ctl = st?.optJSONArray("control")
+        val ctl = hubStates[hubReqHub]?.optJSONArray("control")
         if (ctl != null) for (i in 0 until ctl.length()) {
             val r = ctl.optJSONObject(i) ?: continue
             if (r.optString("req") != hubReq) continue
@@ -2260,7 +2433,11 @@ class MainActivity : AppCompatActivity() {
                     SessionBook.forget(this, id)
                     if (Cfg.replyTarget == id) { Cfg.replyTarget = ""; Cfg.save(this) }
                 }
-                if (hubReqCmd == "channel.create") LogBus.add(tr("канал хаба создан: $hubReqArg", "hub channel created: $hubReqArg"))
+                if (hubReqCmd == "channel.create") {
+                    hubCreateOpen = false   // v1.44: канал создан — форму сворачиваем
+                    hubNameEdit?.clearFocus(); hubGitEdit?.clearFocus()
+                    LogBus.add(tr("канал хаба создан: $hubReqArg", "hub channel created: $hubReqArg"))
+                }
                 if (hubReqCmd == "channel.delete") LogBus.add(tr("канал хаба удалён", "hub channel deleted"))
             }
             hubReqDone = true
@@ -2276,10 +2453,101 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderHub() {
         when (sheetMode) {
-            "conn" -> renderConnections(lastModels)
-            "money" -> renderMoney(lastModels)
+            "conn" -> renderConnections(detailState())
+            "money" -> renderMoney(detailState())
+            "models" -> renderModels(detailState())
+            "hubdet" -> renderHubDetails()
             else -> renderHubChannels(lastModels)
         }
+    }
+
+    // v1.44: экран «подробности» — три прежних экрана хаба за одной строкой
+    private fun openHubDetails() {
+        sheetMode = "hubdet"
+        renderHubDetails()
+        sheetOverlay.visibility = View.VISIBLE
+    }
+
+    private fun renderHubDetails() {
+        sheetList.removeAllViews()
+        addDetailsHubChoice()
+        sheetList.addView(tv(tr("‹ хаб", "‹ hub"), 12.5f, cDim).apply {
+            setPadding(dp(2), dp(4), dp(2), dp(8))
+            setOnClickListener { openHubChannels() }
+        })
+        sheetList.addView(linkRow(tr("модели и лимиты", "models and limits"), tr("какие нейросети подключены к хабу, кто ведущий, лимиты", "which AIs are connected to the hub, who leads, limits")) {
+            openModels()
+        })
+        sheetList.addView(linkRow(tr("подключения", "connections"), tr("ключи API и вход в подписки для хаба", "API keys and subscription sign-in for the hub")) {
+            openConnections()
+        })
+        sheetList.addView(linkRow(tr("расходы", "costs"), tr("хватает ли связки подписок: деньги, лимиты, объём, качество", "is the subscription bundle enough: money, limits, volume, quality")) {
+            openMoney()
+        })
+    }
+
+    // v1.44: что не так в хабе, считаем на телефоне из состояния (limit_error не в счёт: известный глюк мониторинга)
+    private fun hubProblems(st: JSONObject?): List<String> {
+        if (st == null) return listOf(tr("хаб молчит — нет свежего состояния", "hub is silent — no fresh state"))
+        val out = LinkedHashSet<String>()
+        val now = System.currentTimeMillis()
+        val ts = st.optLong("ts", 0L) * 1000L   // хаб отдаёт секунды
+        if (ts > 0 && now - ts > 600_000L) {
+            out.add(tr("хаб молчит с ${hhmm(ts)}", "hub silent since ${hhmm(ts)}"))
+        }
+        val ag = st.optJSONArray("agents")
+        if (ag != null) for (i in 0 until ag.length()) {
+            val a = ag.optJSONObject(i) ?: continue
+            val role = a.optString("role", "agent")
+            if (role == "classifier" || role == "helper") continue
+            val status = a.optString("status", "ok")
+            if (status == "ok" || status == "conserve") continue
+            val label = jstr(a, "label").ifEmpty { jstr(a, "name") }
+            var line = "$label: " + a.optString("status_ru", status)
+            val until = a.optLong("resting_until", 0L) * 1000L
+            if (until > now) line += tr(" до ", " until ") + hhmm(until)
+            out.add(line)
+        }
+        val subs = st.optJSONArray("subscriptions")
+        if (subs != null) for (i in 0 until subs.length()) {
+            val s = subs.optJSONObject(i) ?: continue
+            val until = s.optLong("resting_until", 0L) * 1000L
+            if (until > now) {
+                val label = jstr(s, "label").ifEmpty { subTitle(jstr(s, "name")) }
+                out.add("$label: " + tr("отдыхает до ", "resting until ") + hhmm(until))
+            }
+        }
+        val msubs = st.optJSONObject("money")?.optJSONArray("subscriptions")
+        if (msubs != null) for (i in 0 until msubs.length()) {
+            val s = msubs.optJSONObject(i) ?: continue
+            val label = jstr(s, "label").ifEmpty { subTitle(jstr(s, "name")) }
+            if (s.has("days_left") && !s.isNull("days_left") && s.optInt("days_left") <= 5) {
+                val d = s.optInt("days_left")
+                out.add("$label: " + tr("подписка кончается через $d дн.", "subscription ends in $d d"))
+            }
+            val ws = s.optJSONArray("windows")
+            if (ws != null) for (j in 0 until ws.length()) {
+                val w = ws.optJSONObject(j) ?: continue
+                if (w.isNull("lasts") || w.optBoolean("lasts", true)) continue
+                val runsOut = w.optLong("runs_out_at", 0L) * 1000L
+                val wn = jstr(w, "window_ru").ifEmpty { label }
+                out.add("$wn: " + tr("лимит кончится", "limit runs out") + (if (runsOut > 0) tr(" к ", " by ") + hhmm(runsOut) else ""))
+            }
+        }
+        return out.toList()
+    }
+
+    private fun allHubProblems(): List<String> = hubProblems(hubStates["server"]) +
+        (if (laptopFresh()) hubProblems(hubStates["laptop"]).map { tr("ноутбук: ", "laptop: ") + it } else emptyList())
+
+    private fun hubHealthLine(st: JSONObject?): Pair<String, Int> {
+        // первый запрос ещё в пути — не пугать красным «хаб молчит»
+        if (st == null && System.currentTimeMillis() - firstModelsAskTs < 15000L) return tr("проверяю хаб…", "checking the hub…") to cFaint
+        val p = allHubProblems()
+        val offline = laptopOfflineNote()
+        if (p.isEmpty()) return (if (offline.isNotEmpty()) offline else tr("всё в строю", "all good")) to (if (offline.isNotEmpty()) cFaint else cPlay)
+        return (p.first() + (if (p.size > 1) tr(" · ещё ${p.size - 1}", " · +${p.size - 1} more") else "") +
+            (if (offline.isNotEmpty()) " · $offline" else "")) to 0xFFC9483C.toInt()
     }
 
     // ── экран «расходы»: хватает ли связки подписок ──────────────────────
@@ -2287,7 +2555,7 @@ class MainActivity : AppCompatActivity() {
     // работы с линейкой цен API и качество по агентам. Всё считает хаб: /hubstate → money.
     private fun openMoney() {
         sheetMode = "money"
-        renderMoney(lastModels, loading = true)
+        renderMoney(detailState(), loading = true)
         sheetOverlay.visibility = View.VISIBLE
         fetchModels()
     }
@@ -2296,9 +2564,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderMoney(st: JSONObject?, loading: Boolean = false) {
         sheetList.removeAllViews()
-        sheetList.addView(tv(tr("‹ каналы", "‹ channels"), 12.5f, cDim).apply {
+        addDetailsHubChoice()
+        sheetList.addView(tv(tr("‹ подробности", "‹ details"), 12.5f, cDim).apply {
             setPadding(dp(2), dp(4), dp(2), dp(8))
-            setOnClickListener { sheetMode = "channels"; rebuildSheet(); fetchSessions() }
+            setOnClickListener { openHubDetails() }
         })
         hubCommandStatus(st)?.let { (text, col) ->
             sheetList.addView(tv(text, 12.5f, col).apply { setPadding(dp(2), 0, dp(2), dp(8)) })
@@ -2461,7 +2730,7 @@ class MainActivity : AppCompatActivity() {
         hubCodeEdit?.hasFocus() == true
 
     private fun hubLoginActive(): Boolean {
-        val lg = lastModels?.optJSONObject("login") ?: return false
+        val lg = detailState()?.optJSONObject("login") ?: return false
         return jstr(lg, "state") in setOf("starting", "open_link", "checking")
     }
 
@@ -2470,7 +2739,7 @@ class MainActivity : AppCompatActivity() {
     // и отдаёт в /hubstate только последние четыре символа. Удаление и вход — командой в hub-control.
     private fun openConnections() {
         sheetMode = "conn"
-        renderConnections(lastModels, loading = true)
+        renderConnections(detailState(), loading = true)
         sheetOverlay.visibility = View.VISIBLE
         fetchModels()
     }
@@ -2507,9 +2776,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderConnections(st: JSONObject?, loading: Boolean = false) {
         sheetList.removeAllViews()
-        sheetList.addView(tv(tr("‹ каналы", "‹ channels"), 12.5f, cDim).apply {
+        addDetailsHubChoice()
+        sheetList.addView(tv(tr("‹ подробности", "‹ details"), 12.5f, cDim).apply {
             setPadding(dp(2), dp(4), dp(2), dp(8))
-            setOnClickListener { sheetMode = "channels"; rebuildSheet(); fetchSessions() }
+            setOnClickListener { openHubDetails() }
         })
         hubCommandStatus(st)?.let { (text, col) ->
             sheetList.addView(tv(text, 12.5f, col).apply { setPadding(dp(2), 0, dp(2), dp(8)) })
@@ -2888,7 +3158,7 @@ class MainActivity : AppCompatActivity() {
     // Хаб кладёт на релей JSON (POST /hubstate), телефон читает последнее: GET /hubstate.
     private fun openModels() {
         sheetMode = "models"
-        renderModels(lastModels, loading = true)
+        renderModels(detailState(), loading = true)
         sheetOverlay.visibility = View.VISIBLE
         fetchModels()
     }
@@ -2897,15 +3167,36 @@ class MainActivity : AppCompatActivity() {
         if (Cfg.token.isEmpty() || Cfg.url.isEmpty()) return
         lastModelsFetch = System.currentTimeMillis()
         Thread {
-            val raw = Net.get(Cfg.pin, "${Cfg.url}/hubstate?token=${Cfg.token}")
-            // релей отдаёт {"ok","ts","state":{…хаб…}}; state=null — хаб ещё ничего не прислал
-            val st = try {
-                if (raw.isNullOrBlank()) null else JSONObject(raw).optJSONObject("state")
-            } catch (_: Exception) { null }
+            val replies = HashMap<String, JSONObject>()
+            for (hub in listOf("server", "laptop")) {
+                val reply = try {
+                    val raw = Net.get(Cfg.pin, "${Cfg.url}/hubstate?hub=$hub&token=${Cfg.token}")
+                    if (raw.isNullOrBlank()) null else JSONObject(raw)
+                } catch (_: Exception) { null }
+                // старый релей на ?hub=laptop отдаёт состояние сервера: верим только эху "hub"
+                if (reply?.optBoolean("ok") == true && (hub == "server" || reply.optString("hub") == "laptop"))
+                    replies[hub] = reply
+            }
             main.post {
-                // поздний ответ не смеет подменить шторку, которую уже переключили
-                if (st != null) lastModels = st
-                if (sheetOverlay.visibility == View.VISIBLE && sheetMode == "models") renderModels(lastModels)
+                for ((hub, reply) in replies) {
+                    val state = reply.optJSONObject("state")
+                    // пустое состояние (релей рестартовал, хаб ещё не прислал) экран не стирает: «не в сети» решает возраст ts
+                    if (state != null) {
+                        hubStates[hub] = state
+                        hubStateTs[hub] = reply.optLong("ts", state.optLong("ts") * 1000L)
+                        if (hub == "laptop") laptopSeen = true
+                    }
+                }
+                lastModels = hubStates["server"]
+                // v1.44: подпись строки «хаб · каналы» обновляем на месте, без перестройки шторки
+                if (sheetOverlay.visibility == View.VISIBLE && sheetMode == "channels") {
+                    hubHealthSub?.let { sub ->
+                        val (hText, hCol) = hubHealthLine(lastModels)
+                        sub.text = hText
+                        sub.setTextColor(hCol)
+                    }
+                }
+                if (sheetOverlay.visibility == View.VISIBLE && sheetMode == "models") renderModels(detailState())
                 // пока пишут имя канала, экран не перерисовываем: поле потеряло бы фокус
                 if (sheetOverlay.visibility == View.VISIBLE && (sheetMode == "hubch" || sheetMode == "conn" ||
                         sheetMode == "money") && !hubTyping()) renderHub()
@@ -2915,9 +3206,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderModels(st: JSONObject?, loading: Boolean = false) {
         sheetList.removeAllViews()
-        sheetList.addView(tv(tr("‹ каналы", "‹ channels"), 12.5f, cDim).apply {
+        addDetailsHubChoice()
+        sheetList.addView(tv(tr("‹ подробности", "‹ details"), 12.5f, cDim).apply {
             setPadding(dp(2), dp(4), dp(2), dp(8))
-            setOnClickListener { sheetMode = "channels"; rebuildSheet(); fetchSessions() }
+            setOnClickListener { openHubDetails() }
         })
         hubCommandStatus(st)?.let { (text, col) ->
             sheetList.addView(tv(text, 12.5f, col).apply { setPadding(dp(2), 0, dp(2), dp(8)) })

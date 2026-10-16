@@ -215,12 +215,22 @@ class BridgeService : Service() {
     private var autoSendTimer: Runnable? = null   // v0.5: авто-отправка по тишине (безрукий)
     @Volatile private var lastFinalTs = 0L        // v0.8: последняя реальная диктовка (для сна микрофона)
     @Volatile private var listenStartedAt = 0L    // v0.12: когда микрофон подняли (сон считать от НЕГО)
+    @Volatile private var micLiveAt = 0L          // v1.43: когда запись реально пошла (0 — ещё ждём канал)
+    private var listenIsResume = false            // v1.43: этот подъём — продолжение диктовки с паузы
+    private var resumeRequested = false
+    private var draftStartTs = 0L                 // v1.43: подъём, на котором начат текущий черновик
     @Volatile private var lastPlaybackTs = 0L     // v0.8: последняя озвучка
     // v0.35: диктовка через серверный Whisper — свой рекордер вместо SpeechRecognizer
     @Volatile private var recThread: Thread? = null
     @Volatile private var uttId = ""
     @Volatile private var uttSeq = 0
     @Volatile private var uttSpeechMs = 0
+    @Volatile private var segLiveMs = 0   // v1.47: речь текущего, ещё не отгруженного сегмента (для skipWait)
+    // v1.48 (боевое 16.10: «диктовал 2-3 минуты, влез ответ другой сессии, и отправилось туда»):
+    // адресат открытой диктовки фиксируется первым отгруженным куском. Озвучка посреди неё
+    // двигает lastSession — без этой фиксации остаток монолога и «отправляй» уезжали к говорившему.
+    @Volatile private var dictSid = ""
+    @Volatile private var dictSidUtt = ""
     // v0.46 (ревью): абсолютный предел whisper-черновика меряется ЗАПИСАННЫМ звуком и живёт
     // вместе с utt, а не с одним проходом рекордера — тот умирает на КАЖДОЙ прилетевшей озвучке
     // (playNext → stopListening), и локальный «абсолютный» предел не наступал никогда.
@@ -667,6 +677,10 @@ class BridgeService : Service() {
     // работает простое правило: отвечаю тому, кто говорил последним. Слово юзера: «я выбрал
     // каналы в работу, между ними приоритет закреплять не надо».
     private var manualPinTs = 0L
+    // v1.44 (ревью v1.43): счётчик ЯВНЫХ смен адресата (голосом, кнопкой, «ответ в крайнюю»).
+    // Экран сверяет его и снимает выбор «смотрю X»: лента идёт за новым адресатом. Смены
+    // по последнему говорившему его не трогают — ленту не выдёргивают из-под чтения.
+    @Volatile var targetEpoch = 0
     // v1.16-fix (боевое, повторялось: «играет ответ Y, я на экране перехожу в X, озвучка кончилась,
     // диктую, „отправляй“ — ушло в Y»). Три минуты считались от ТАПА, а длинный ответ Y
     // (несколько частей, ожидание хвоста до 60с) играет дольше: к подъёму микрофона штамп
@@ -675,10 +689,21 @@ class BridgeService : Service() {
     // нового сообщения (новое сообщение = новый «последний говоривший», дальше снова три минуты).
     // MAX до первой озвучки: восстановленное после рестарта закрепление выбором не считается.
     private var speakerStartTs = Long.MAX_VALUE
+    private var replaySelSeen = 0   // v1.46: номер переслушанной выборки — штамп говорившего ставим раз на выборку
+    // v1.46: состояние «последнего говорившего» до переслушивания — откат, если звук выборки весь пропал.
+    // v1.47 (ревью): без speakerStartTs/answeredCurrent/lastProj откат оставлял штамп «сейчас» —
+    // manualPinHolds() ложно, и ручной выбор юзера терялся на ближайшем подъёме микрофона.
+    private class ReplayPrev(val session: String?, val target: String, val pinTs: Long,
+                             val speakerTs: Long, val answered: Boolean, val proj: String?)
+    private var replayPrev: ReplayPrev? = null
 
+    // v1.46 (слово юзера: «адресат — тот, чью озвучку я слышал ПОСЛЕДНЕЙ»). Трёхминутная льгота
+    // снята: старый выбор X побеждал Y, который заговорил ПОСЛЕ выбора. Теперь ручной выбор держится
+    // до ближайшей новой озвучки (любой сессии, включая переслушанное) или до отправки в него.
+    // Три минуты остались только восстановленному после рестарта закреплению — до первой озвучки.
     private fun manualPinHolds(): Boolean =
-        manualPinTs > 0L &&
-            (System.currentTimeMillis() - manualPinTs < 180000 || manualPinTs >= speakerStartTs)
+        manualPinTs > 0L && (manualPinTs >= speakerStartTs ||
+            (speakerStartTs == Long.MAX_VALUE && System.currentTimeMillis() - manualPinTs < 180000))
     // v0.54: фразы, которые надо сыграть, КАК ТОЛЬКО допишется их файл (синтез асинхронный).
     // Живой TTS на музыкальном канале звучит тише файла — на улице юзер его не слышит (урок v0.38).
     private val cuePlayWhenReady: MutableSet<String> =
@@ -1570,7 +1595,9 @@ class BridgeService : Service() {
                                     if (!alive) return@post
                                     when {
                                         playing -> stopPlayback(thenListen = true)
-                                        listening && draft.isNotEmpty() -> { LogBus.add(tr("кнопка (правая) — отправляю", "button (right) — sending")); beginSend() }
+                                        // v1.47: в whisper черновика на телефоне нет — сказанное (600мс в открытом utt) тоже отправляем, не стираем
+                                        listening && (draft.isNotEmpty() || saidSomething()) -> { LogBus.add(tr("кнопка (правая) — отправляю", "button (right) — sending")); beginSend() }
+                                        skipWait() -> {}   // v1.46: зазор/хвост — «дальше»
                                         else -> onCancel()
                                     }
                                 }
@@ -1764,6 +1791,8 @@ class BridgeService : Service() {
         touchUser()
         if (Cfg.whisper && recThread != null) cancelReq = true
         draft.setLength(0)
+        draftStartTs = 0L      // v1.43 (ревью): стёртый черновик не даёт начало следующему
+        listenIsResume = false // v1.43 (ревью): продолжение отменено — ответ больше не держим
         pendingSend = false
         cancelAutoSend()
         resetSendWindow()   // v0.46
@@ -1838,7 +1867,9 @@ class BridgeService : Service() {
         touchUser()
         dictHold = false
         LogBus.add(tr("продолжаю диктовку в то же сообщение", "continuing dictation into the same message"))
+        resumeRequested = true
         startListening()
+        resumeRequested = false
     }
 
     // v0.43 (слово юзера: «хочу заглушить микрофон — слушать ответы, но окружение не писать,
@@ -1952,7 +1983,7 @@ class BridgeService : Service() {
     private fun speechInFlight(): Boolean =
         draft.isNotEmpty() ||
             (Cfg.whisper && uttId.isNotEmpty() &&
-                (uttSpeechMs > 600 || (recThread != null && System.currentTimeMillis() - lastVoiceTs < 2500)))
+                (uttSpeechMs + segLiveMs > 600 || (recThread != null && System.currentTimeMillis() - lastVoiceTs < 2500)))
 
     @Volatile private var pendingTargetSid: String? = null
     private var pendingTargetListen = false
@@ -1999,6 +2030,7 @@ class BridgeService : Service() {
 
     private fun applyTarget(sid: String) {
         Cfg.replyTarget = sid
+        targetEpoch++
         manualPinTs = System.currentTimeMillis()
         Cfg.save(this)
         soloFollow(sid)
@@ -2218,10 +2250,15 @@ class BridgeService : Service() {
 
     // v0.69: лента экрана показывает разговор адресата — ей нужен sid, не имя (у юзера
     // дубли имён проектов). Чтение без побочек, логика движка не меняется.
-    fun replyTargetSid(): String = Cfg.replyTarget.ifEmpty { lastSession ?: "" }
+    fun replyTargetSid(): String {
+        val u = uttId
+        // сервер уже закрыл utt (rotateReq ждёт рекордера): следующее сообщение — новое, фиксация не его
+        if (u.isNotEmpty() && u == dictSidUtt && dictSid.isNotEmpty() && !rotateReq) return dictSid
+        return Cfg.replyTarget.ifEmpty { lastSession ?: "" }
+    }
 
     fun replyTargetName(): String {
-        val sid = Cfg.replyTarget.ifEmpty { lastSession ?: "" }
+        val sid = replyTargetSid()
         if (sid.isEmpty()) return "—"
         return SessionBook.all().firstOrNull { it.sid == sid }?.proj?.ifEmpty { sid.take(8) }
             ?: lastProj ?: sid.take(8)
@@ -2264,16 +2301,66 @@ class BridgeService : Service() {
 
     // Play an explicit list of audio URLs (a chosen message and everything after
     // it), replacing whatever is queued. Downloaded lazily like the live path.
-    // Also points the reply target at that session so answers go where expected.
-    fun playFrom(sid: String, proj: String, items: List<Pair<String, Long>>) {
+    // v1.43 (решение юзера 16.10, журнал 08:11–08:14: после «озвучить» старое сообщение соседнего канала
+    // адресат уезжал в тот канал). Переслушать — это чтение, не разговор: keepTarget=true не
+    // трогает ни lastSession, ни «кто говорил последним», ни адресата. Голосовое «крайнее»
+    // (keepTarget=false) ведёт себя по-старому — там юзер сам позвал последнего говорившего.
+    // text — текст выбранного из ленты: если звук на релее уже удалён (404 у всех частей),
+    // его прочтём вместо звука.
+    @Volatile private var chosenSel = 0
+    private var chosenTotal = 0
+    private var chosenOk = 0
+    private var chosenFail = 0
+    private var chosenText = ""
+
+    fun playFrom(sid: String, proj: String, items: List<Pair<String, Long>>,
+                 text: String = "", keepTarget: Boolean = true) {
         if (items.isEmpty()) return
         stopPlayback()
+        val sel = ++chosenSel
+        chosenTotal = items.size; chosenOk = 0; chosenFail = 0; chosenText = text
         for ((ap, ts) in items) {
             playQueue.addLast(JSONObject().put("type", "voice").put("audio", ap)
-                .put("session", sid).put("proj", proj).put("ts", ts))
+                .put("session", sid).put("proj", proj).put("ts", ts)
+                .put("sel", sel).put("keepTarget", keepTarget))
         }
         LogBus.add(tr("играю выбранное из «$proj»: ${items.size} ч.", "playing the selection from “$proj”: ${items.size} parts"))
         kickPlayback()
+    }
+
+    // v1.43 (журнал 16.10: «ошибка загрузки звука: HTTP 404» дважды — и сразу «слушаю, <канал>»).
+    // Релей хранит только свежие файлы, лента помнит старые сообщения дольше. Все части выбранного
+    // не скачались — одна фраза (или текст сообщения, если он есть), и микрофон НЕ поднимаем:
+    // юзер просил послушать, а не говорить. Возвращает true, если провал выбранного обработан.
+    private fun chosenPartDone(o: JSONObject, ok: Boolean): Boolean {
+        val sel = o.optInt("sel", 0)
+        if (sel == 0 || sel != chosenSel) return false
+        if (ok) chosenOk++ else chosenFail++
+        if (ok || chosenOk > 0 || chosenOk + chosenFail < chosenTotal) return false
+        chosenSel++   // разобрались — последующие отказы этого выбора не повторят фразу
+        noAutoWakeUntil = System.currentTimeMillis() + 15000
+        val t = chosenText.trim()
+        // v1.46 (ревью): ни звука, ни текста — юзер этот канал не услышал, адресат возвращается к прежнему
+        val prev = replayPrev
+        if (t.isEmpty() && prev != null && sel == replaySelSeen && lastSession == o.optString("session") && !speechInFlight()) {
+            lastSession = prev.session
+            lastProj = prev.proj
+            speakerStartTs = prev.speakerTs
+            answeredCurrent = prev.answered
+            if (Cfg.replyTarget.isEmpty() && prev.target.isNotEmpty()) {
+                Cfg.replyTarget = prev.target
+                manualPinTs = prev.pinTs
+                Cfg.save(this)
+            }
+            lastAnnouncedTarget = null
+            getSharedPreferences("bridge", MODE_PRIVATE).edit().putString("lastSession", lastSession).apply()
+        }
+        replayPrev = null
+        LogBus.add(tr("звук выбранного на релее уже удалён", "the selection's audio is gone from the relay") +
+            (if (t.isNotEmpty()) tr(" — читаю текст", " — reading the text") else ""))
+        val gone = tr("звук этого сообщения уже удалён", "this message's audio is gone")
+        say(if (t.isNotEmpty()) gone + tr(", читаю текст. ", ", reading the text. ") + t.take(400) else gone)
+        return true
     }
 
     // Button send: force-finalize the in-flight segment instead of dropping it,
@@ -2453,7 +2540,7 @@ class BridgeService : Service() {
                     while (unsent.isNotEmpty()) {
                         val t = unsent.pollFirst() ?: break
                         LogBus.add(tr("досылаю сохранённое: ${t.take(50)}", "resending saved: ${t.take(50)}"))
-                        send(t, attempt = 1)
+                        send(t, attempt = 1, began = 0L)   // v1.43: старый текст — не ответ на текущее
                     }
                 }
             }
@@ -2548,7 +2635,13 @@ class BridgeService : Service() {
                 LogBus.add((if (partLive) tr("часть монолога доехала (потолок), диктовка продолжается: ", "part of the monologue arrived (cap), dictation continues: ")
                     else if (part) tr("запоздалая часть монолога доехала: ", "late part of the monologue arrived: ") else tr("отправлено (whisper): ", "sent (whisper): ")) +
                     o.optString("text").take(60))
-                answeredCurrent = true   // v0.81: ответ дан — зазор больше не приглашает
+                // v0.81: ответ дан — зазор больше не приглашает.
+                // v1.42 (журнал 16.10 07:52): подтверждение приходит через секунды после отправки,
+                // а очередь за это время уже запустила СЛЕДУЮЩИЙ ответ — и чужое «ушло» засчитывалось
+                // ему как ответ, зазор на его границе пропадал, следующий канал играл встык.
+                // Ответом считаем только диктовку, начатую после того, как зазвучало текущее сообщение.
+                val began = if (tail) 0L else if (dict > 0) dict else (o.optString("utt").toLongOrNull(36) ?: 0L)
+                if (began >= speakerStartTs) answeredCurrent = true
                 // v0.85: ручной выбор был НА ОДНО сообщение — оно ушло. v1.16-fix: только если
                 // ушло В ВЫБРАННЫЙ канал и закрыто ПОСЛЕ выбора: запоздалое подтверждение
                 // прошлого сообщения не должно стирать выбор, сделанный уже после него.
@@ -2961,6 +3054,15 @@ class BridgeService : Service() {
         playNext()
     }
 
+    // v1.47 (ревью): ожидание хвоста перепроверяет очередь раз в секунду. Каждый чужой входящий
+    // зовёт kickPlayback, и каждый заводил свою цепочку — они копились. Теперь цепочка одна.
+    private var tailTicking = false
+    private fun tailTick() {
+        if (tailTicking) return
+        tailTicking = true
+        main.postDelayed({ tailTicking = false; if (alive && !playing) kickPlayback() }, 1000)
+    }
+
     private fun playNext() {
         if (paused) return   // v0.9: в паузе ничего не запускаем поверх — продолжение только кнопкой
         // v0.5.3 (слово юзера: «ответ на первое включается, пока я диктую второе»): если идёт диктовка
@@ -2986,11 +3088,23 @@ class BridgeService : Service() {
         // перебивает готовый ответ»). Между подъёмом микрофона и первым словом есть окно, где
         // «говорит ли он» ещё ложно — и ответ прорывался ровно в него. Явный подъём (кнопка,
         // тангента, круг) САМ ПО СЕБЕ означает «сейчас скажу»: даём 10с на начало речи.
-        val justRaisedByHand = listening &&
-            System.currentTimeMillis() - listenStartedAt < 10000 &&
-            System.currentTimeMillis() - userActionTs < 12000
+        // v1.43 (журнал 16.10 08:12: «продолжаю диктовку» → микрофон ждал гарнитуру и ушёл на
+        // телефон → через 13с ответ заиграл поверх диктовки). 10с считались от подъёма, а ожидание
+        // канала гарнитуры (до ~8с) съедало их целиком: человек ещё не мог говорить, а окно уже
+        // кончилось. Теперь 10с — от РЕАЛЬНОГО старта записи; пока запись не встала — держим
+        // (не дольше 20с от подъёма). Продолженная диктовка («продолжаю диктовку») — открытый
+        // черновик сама по себе: держим до отправки/отмены, под общим потолком ниже.
+        val nowH = System.currentTimeMillis()
+        val raisedByHand = listening && userActionTs > listenStartedAt - 2000
+        val justRaisedByHand = raisedByHand &&
+            (if (micLiveAt == 0L) nowH - listenStartedAt < 20000 else nowH - micLiveAt < 10000)
         val speakingNow = draft.isNotEmpty() || justRaisedByHand ||
-            (Cfg.whisper && recThread != null && uttSpeechMs >= 600) ||
+            (listening && listenIsResume) ||
+            // v1.43: recThread == null — это ожидание канала/перезапуск рекордера, а не конец
+            // черновика: сказанное в открытый utt по-прежнему ждёт отправки
+            // v1.48: + речь неотгруженного сегмента — после реза потолком uttSpeechMs обнулён,
+            // и до следующей отгрузки (~20с) придержка держалась только 4-секундными датчиками
+            (Cfg.whisper && uttId.isNotEmpty() && uttSpeechMs + segLiveMs >= 600) ||
             // v1.41: потолок только что дорезал часть — newUtt обнулил uttSpeechMs, но человек
             // посреди мысли; окно короткое, дальше живость держат датчики ниже
             (Cfg.whisper && recThread != null && System.currentTimeMillis() - capPartAt < 6000) ||
@@ -3042,7 +3156,33 @@ class BridgeService : Service() {
         // не доиграно, её части имеют приоритет; вторая сессия ждёт своей очереди целиком.
         val o = (if (currentSid != null) playQueue.firstOrNull { it.optString("session") == currentSid } else null)
             ?: playQueue.peekFirst()
+        // v1.46 (слово юзера: «два ответа разных сессий играют встык»). Ожидание хвоста (v0.42)
+        // жило только на ПУСТОЙ очереди: стоило другой сессии прислать ответ, пока часть 2 из 3
+        // ещё синтезируется, — и чужой ответ влезал в середину, а зазор (он требует доигранного
+        // сообщения) не срабатывал вовсе. Теперь хвост ждём и при чужом в очереди, тем же потолком
+        // 60с; переслушанное с экрана (явное «слушать») не ждёт.
+        if (o != null && currentSid != null && lastPartNum < lastPartsTotal &&
+            o.optString("session") != currentSid && !o.optBoolean("keepTarget", false)
+        ) {
+            val now = System.currentTimeMillis()
+            if (partWaitDeadline == 0L) {
+                partWaitDeadline = now + 60000
+                LogBus.add(tr("сообщение не докачано ($lastPartNum/$lastPartsTotal) — «${o.optString("proj")}» подождёт хвост", "message incomplete ($lastPartNum/$lastPartsTotal) — “${o.optString("proj")}” waits for the tail"))
+            }
+            if (now < partWaitDeadline) {
+                playing = false
+                abandonFocus()
+                updateNotification()
+                tailTick()
+                return
+            }
+            LogBus.add(tr("часть ${lastPartNum + 1}/$lastPartsTotal так и не пришла — считаю сообщение конченым", "part ${lastPartNum + 1}/$lastPartsTotal never arrived — treating the message as finished"))
+            partWaitDeadline = 0L
+            lastPartsTotal = lastPartNum
+        }
         if (o == null) {
+            // v1.47 (ревью): «дальше» без следующего — пропуск зазора не потреблён, позже он подавил бы чужой
+            boundarySuppress = false
             // v0.42: сообщение сыграно не целиком (часть N из M) — ждём хвост, микрофон
             // НЕ поднимаем (batch не сбрасываем — он держит гейт диктовки)
             if (currentSid != null && lastPartNum < lastPartsTotal) {
@@ -3055,7 +3195,7 @@ class BridgeService : Service() {
                     playing = false
                     abandonFocus()
                     updateNotification()
-                    main.postDelayed({ if (alive && !playing) kickPlayback() }, 1000)
+                    tailTick()
                     return
                 }
                 LogBus.add(tr("часть ${lastPartNum + 1}/$lastPartsTotal так и не пришла — считаю сообщение конченым", "part ${lastPartNum + 1}/$lastPartsTotal never arrived — treating the message as finished"))
@@ -3077,6 +3217,7 @@ class BridgeService : Service() {
         }
 
         if (holdForHeadset()) {
+            boundarySuppress = false   // v1.47: ждём наушники неопределённо долго — пропуск зазора к тому времени не про это
             playing = false
             abandonFocus()
             LogBus.add(tr("жду наушники (${playQueue.size} в очереди)", "waiting for headphones (${playQueue.size} in queue)"))
@@ -3113,9 +3254,10 @@ class BridgeService : Service() {
         val nextSid = o.optString("session")
         val moreOfCurrent = currentSid != null && playQueue.any { it.optString("session") == currentSid }
         val msgDone = lastPartsTotal <= lastPartNum
+        val keepTgt = o.optBoolean("keepTarget", false)
         if (boundarySuppress) {
             boundarySuppress = false
-        } else if (!dictHold && !moreOfCurrent && msgDone && !answeredCurrent &&
+        } else if (!keepTgt && !dictHold && !moreOfCurrent && msgDone && !answeredCurrent &&
             // v0.90.1 (боевое: «ответил, отправил — а он говорит „ответь мета судья“,
             // потом „отправлено“, потом „слушаю…“ — всё в кашу»): сервер подтверждает
             // отправку 2-3 секунды, и в это окно зазор считал, что ответа ещё не было.
@@ -3168,7 +3310,9 @@ class BridgeService : Service() {
                 // 1800мс, а не 900: реплика «слушаю, <имя>» синтезируется прямо сейчас, и
                 // раньше файл ещё не готов — фраза уходила тихим живым TTS без первого слога
                 if (Cfg.handsFree && System.currentTimeMillis() > noAutoWakeUntil) main.postDelayed({
-                    if (alive && !dictHold && !listening && !playing) startListening()
+                    // v1.43 (ревью): за 1800мс мог прийти запрет пробуждения (провал «озвучить»)
+                    if (alive && !dictHold && !listening && !playing &&
+                        System.currentTimeMillis() > noAutoWakeUntil) startListening()
                 }, 1800)
                 buzz(140)
             }
@@ -3179,21 +3323,57 @@ class BridgeService : Service() {
                 return
             }
         }
+        // v1.46: встык без зазора — в журнал, почему (для следующего полевого разбора)
+        if (!keepTgt && lastSession != null && nextSid.isNotEmpty() && nextSid != lastSession && boundarySid != nextSid)
+            LogBus.add(tr("встык без зазора → «${o.optString("proj")}»: dictHold=$dictHold answered=$answeredCurrent ack=${uttAckTimer != null} fin=$finalizeReq parts=$lastPartNum/$lastPartsTotal", "back-to-back, no gap → '${o.optString("proj")}': dictHold=$dictHold answered=$answeredCurrent ack=${uttAckTimer != null} fin=$finalizeReq parts=$lastPartNum/$lastPartsTotal"))
         boundarySid = null
         playQueue.remove(o)
-        answeredCurrent = false   // играет новое сообщение — ответа на него ещё не было
         playing = true
         stopListening() // half-duplex: never transcribe our own playback
-        // новое сообщение (не очередная часть того же) — заговорил новый «последний говоривший»
-        if (o.optString("session") != lastSession || o.optInt("part", 1) <= 1)
-            speakerStartTs = System.currentTimeMillis()
-        lastSession = o.optString("session")
-        currentSid = lastSession
+        if (!keepTgt) {
+            answeredCurrent = false   // играет новое сообщение — ответа на него ещё не было
+            // новое сообщение (не очередная часть того же) — заговорил новый «последний говоривший»
+            if (o.optString("session") != lastSession || o.optInt("part", 1) <= 1)
+                speakerStartTs = System.currentTimeMillis()
+            lastSession = o.optString("session")
+        } else {
+            // v1.46 (слово юзера: «включил сообщение на экране X — значит отвечаю X, и после ухода
+            // с экрана тоже»). v1.43 держала переслушанное в стороне от адресата — это и увозило
+            // ответ в прежнюю сессию. Теперь переслушанное = последний слышанный: lastSession и
+            // штамп говорившего переезжают сюда, и отсчёт «ответил ли юзер» начинается заново (раз
+            // на выборку): иначе ответ, отданный прошлому каналу, снимал бы зазор после переслушанного.
+            // Ручной выбор другого канала снимаем, кроме solo. Открытая диктовка — ничего не трогаем:
+            // сегменты читают адресата (в том числе динамический lastSession) в момент отгрузки (ревью).
+            val rs = o.optString("session")
+            val sel = o.optInt("sel", 0)
+            if (rs.isNotEmpty() && speechInFlight()) {
+                LogBus.add(tr("переслушиваю «${o.optString("proj")}» — диктовка открыта, адресат прежний", "replaying “${o.optString("proj")}” — dictation open, target unchanged"))
+            } else if (rs.isNotEmpty()) {
+                if (rs != lastSession || sel != replaySelSeen) {
+                    // запоминаем прежнее: если звук выборки весь пропал (404), откатим (chosenPartDone)
+                    replayPrev = ReplayPrev(lastSession, Cfg.replyTarget, manualPinTs,
+                        speakerStartTs, answeredCurrent, lastProj)
+                    speakerStartTs = System.currentTimeMillis()
+                    answeredCurrent = false
+                }
+                replaySelSeen = sel
+                lastSession = rs
+                lastProj = o.optString("proj").ifEmpty { lastProj }
+                if (Cfg.replyTarget.isNotEmpty() && Cfg.replyTarget != rs && !soloActive()) {
+                    Cfg.replyTarget = ""
+                    manualPinTs = 0L
+                    Cfg.save(this)
+                    lastAnnouncedTarget = null
+                    LogBus.add(tr("переслушиваю «${lastSpokenName()}» — отвечать буду туда", "replaying “${lastSpokenName()}” — replies go there"))
+                }
+            }
+        }
+        currentSid = o.optString("session")
         lastPartNum = o.optInt("part", 1)          // v0.42: знаем, докачано ли сообщение
         lastPartsTotal = o.optInt("parts", 1)
         partWaitDeadline = 0L
         val proj = o.optString("proj")
-        lastProj = proj
+        if (!keepTgt) lastProj = proj
         // v0.51: адресат ответа только что переехал на эту сессию — готовим её имя голосом,
         // пока играет сам ответ (к «слушаю» файл успеет дописаться)
         ensureTargetCues()
@@ -3201,7 +3381,7 @@ class BridgeService : Service() {
         if (ts > 0) {
             lastEventTs = maxOf(lastEventTs, ts)
             val prefs = getSharedPreferences("bridge", MODE_PRIVATE)
-            val heardKey = "heard_" + (lastSession ?: "")
+            val heardKey = "heard_" + currentSid.orEmpty()
             prefs.edit()
                 .putLong("lastPlayedTs", lastEventTs)
                 .putString("lastSession", lastSession)
@@ -3242,7 +3422,15 @@ class BridgeService : Service() {
                         main.post {
                             if (!alive) return@post
                             LogBus.add(tr("ошибка загрузки звука: ${e.message}", "audio load error: ${e.message}"))
-                            if (gen == playGen) playNext()
+                            if (gen == playGen) {
+                                // v1.43: весь выбранный звук удалён — фраза вместо тишины, и пустая
+                                // очередь не поднимет микрофон (noAutoWakeUntil) и не пискнет
+                                if (chosenPartDone(o, false) && playQueue.isEmpty()) {
+                                    playing = false
+                                    abandonFocusAfterCues(0)
+                                }
+                                playNext()
+                            }
                         }
                         return@Thread
                     }
@@ -3252,6 +3440,7 @@ class BridgeService : Service() {
             main.post {
                 if (!alive) return@post
                 if (gen != playGen) return@post   // за время докачки нажали «стоп» — часть не играем
+                chosenPartDone(o, true)
                 batch.add(file)
                 pruneCache()
                 if (announce) speakThenPlay(proj, file, gen) else playFile(file, gen = gen)
@@ -3446,6 +3635,19 @@ class BridgeService : Service() {
         focusReq?.let { audioManager.abandonAudioFocusRequest(it) }
     }
 
+    // v1.44 (ревью v1.43): фраза «звук удалён» играет без своего фокуса. Отдать фокус сразу
+    // за ней — пустить чужую музыку поверх фразы. Отдаём, когда реплики отзвучали;
+    // если за это время стартовал новый ответ, фокус уже его — не трогаем. Потолок — от
+    // зависания (60с), а не от длины: чтение текста вслух бывает дольше 8с (ревью v1.44).
+    private fun abandonFocusAfterCues(tries: Int) {
+        main.postDelayed({
+            if (!alive || playing) return@postDelayed
+            val busy = cuePlayer != null || cueQueue.isNotEmpty() || cuePlayWhenReady.isNotEmpty() ||
+                ttsSpeaking || System.currentTimeMillis() < cuePendingUntil
+            if (busy && tries < 120) abandonFocusAfterCues(tries + 1) else abandonFocus()
+        }, 500)
+    }
+
     private fun setupTts() {
         try {
             tts = TextToSpeech(this) { status ->
@@ -3568,6 +3770,8 @@ class BridgeService : Service() {
         dictHold = false   // v0.37: любое поднятие микрофона снимает паузу диктовки
         micAsleep = false  // v0.50: проснулись
         listenStartedAt = System.currentTimeMillis()   // v0.12: свежеподнятый микрофон не усыплять
+        micLiveAt = 0L
+        listenIsResume = resumeRequested
         // v1.40 (боевое: «через три секунды после „ответь X, дальше Y“ уже играет Y — я и рта
         // не открыл»): 12с зазора считались от объявления, а фраза, «слушаю» и подъём SCO съедали
         // их почти целиком. Окно на ответ отсчитываем от РЕАЛЬНО поднятого микрофона.
@@ -3606,7 +3810,7 @@ class BridgeService : Service() {
         // человек начал говорить, а не после того, как сообщение уехало не туда. Имя называем
         // ТОЛЬКО когда адресат сменился: длинная реплика на каждый подъём микрофона съедала бы
         // первое слово (рекордер стартует через 900мс, а эхо-гейт глушит кадры на всю реплику).
-        val tgtSid = Cfg.replyTarget.ifEmpty { lastSession ?: "" }
+        val tgtSid = replyTargetSid()
         // v0.55 (боевое, слово юзера: «пришёл вопрос от playbook, я ответил — а ушло опять в
         // войсбридж, почему?»). Потому что ЗАКРЕПЛЁННЫЙ адресат сильнее правила «последняя
         // игравшая», а раз он не меняется, имя переставало звучать вовсе — и расхождение между
@@ -3772,6 +3976,7 @@ class BridgeService : Service() {
         uttId = java.lang.Long.toString(System.currentTimeMillis(), 36)
         uttSeq = 0
         uttSpeechMs = 0
+        segLiveMs = 0
         whArmedMs = 0L   // v0.46: абсолютный предел живёт вместе с черновиком, не с проходом рекордера
     }
 
@@ -3810,9 +4015,11 @@ class BridgeService : Service() {
             main.post { recThread = null; main.postDelayed({ if (alive && listening) startWhisperCycle() }, 1000) }
             return
         }
+        if (micLiveAt == 0L) micLiveAt = System.currentTimeMillis()   // v1.43: окно «сейчас скажу» — отсюда
         if (uttId.isEmpty()) newUtt()
         val seg = java.io.ByteArrayOutputStream()
         var segSpeechMs = 0
+        segLiveMs = 0
         var quietMs = 0
         var warned = false
         var badReads = 0    // v0.36: мёртвый AudioRecord крутил busy-spin на 100% ядра
@@ -3892,6 +4099,7 @@ class BridgeService : Service() {
                 lastLoudTs = now
                 segSpeechMs += 20; quietMs = 0
             } else quietMs += 20
+            segLiveMs = segSpeechMs
             // МЯГКИЙ детектор (v0.46) — только живость и авто-отправка. Порог тот же (+6),
             // отличается ЛИШЬ тем, как считается фон: минимум за окно вместо среднего,
             // которое училось на речи. Подтверждение 160мс — против щелчков и швов асфальта.
@@ -3954,7 +4162,9 @@ class BridgeService : Service() {
                         )
                     }
                     seg.reset(); segSpeechMs = 0; quietMs = 0; quietSoftMs = 0; warned = false
+                    val carrySid = byCap && dictSidUtt == uttId   // v1.48: дорезанный монолог — тот же адресат
                     newUtt()
+                    if (carrySid) dictSidUtt = uttId
                     armedTs = 0L
                     capForced = false
                     // v0.50: одно сообщение на ответ. v0.52: но только если отправку выбрал человек —
@@ -3969,7 +4179,7 @@ class BridgeService : Service() {
                 val cutMid = if (byPause) "" else if (byLen) "len" else if (byProbe) "probe" else ""
                 probeNext = hasSpeech && cutMid == "len"
                 if (hasSpeech) {
-                    uploadSeg(seg.toByteArray(), false, cut = cutMid); uttSpeechMs += segSpeechMs; lastFinalTs = now
+                    uploadSeg(seg.toByteArray(), false, cut = cutMid); uttSpeechMs += segSpeechMs; segLiveMs = 0; lastFinalTs = now
                     lastRealSpeechTs = now   // v0.98: подтверждённая речь продлевает придержку
                     // v0.42 (боевое «потолок 45с отрезал живую диктовку посреди мысли»):
                     // отгруженный сегмент = живая диктовка продолжается, потолок отодвигается.
@@ -4042,7 +4252,7 @@ class BridgeService : Service() {
             uttId = ""; uttSpeechMs = 0; whArmedMs = 0L
         } else if (segSpeechMs >= 500) {
             uploadSeg(seg.toByteArray(), false)
-            uttSpeechMs += segSpeechMs
+            uttSpeechMs += segSpeechMs; segLiveMs = 0
             lastRealSpeechTs = System.currentTimeMillis()   // v0.98
         }
         recThread = null
@@ -4077,7 +4287,8 @@ class BridgeService : Service() {
             }
             return
         }
-        val sid = Cfg.replyTarget.ifEmpty { lastSession ?: "" }
+        val sid = replyTargetSid()
+        if (sid.isNotEmpty() && dictSidUtt != u) { dictSid = sid; dictSidUtt = u }
         // v0.36 (аудит): раньше пустой адресат уезжал на сервер, тот молча ронял текст,
         // а телефон получал utt_sent и уверенно говорил «ушло». Честный отказ — как в send().
         if (sid.isEmpty()) {
@@ -4318,6 +4529,7 @@ class BridgeService : Service() {
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             }
             recActive = true   // v0.46: сессия распознавателя реально стартует
+            if (micLiveAt == 0L) micLiveAt = System.currentTimeMillis()   // v1.43
             startListening(intent)
         }
     }
@@ -4343,6 +4555,34 @@ class BridgeService : Service() {
     // идёт ли прямо сейчас зазор между каналами (окно на твой ответ)
     private fun gapOpen(): Boolean =
         boundarySid != null && System.currentTimeMillis() < boundaryHoldUntil
+
+    // v1.46: правая кнопка гарнитуры в зазоре между каналами или в ожидании хвоста = «дальше»:
+    // не ждать, играть следующего. Раньше она там шла в onCancel — «отменено» и та же тишина.
+    // Начатую диктовку не трогаем: с черновиком кнопка отправляет (ветка выше).
+    // v1.47 (ревью): speechInFlight() считает речью и голос < 2.5с назад — на улице это ветер
+    // в пустом микрофоне зазора, и кнопка падала в onCancel. Здесь речь — только по закону
+    // «есть речь» (600мс сказанного в открытом utt, с неотгруженным сегментом) или черновик.
+    private fun saidSomething(): Boolean =
+        draft.isNotEmpty() || (Cfg.whisper && uttId.isNotEmpty() && uttSpeechMs + segLiveMs >= 600)
+
+    fun skipWait(): Boolean {
+        if (playing || paused || saidSomething()) return false
+        val gap = gapOpen() && playQueue.isNotEmpty()
+        val tail = partWaitDeadline > 0L && currentSid != null && lastPartNum < lastPartsTotal
+        if (!gap && !tail) return false
+        if (gap) boundaryHoldUntil = 0L
+        if (tail) {
+            // хвост не ждём; очередь пуста — playNext закроет сообщение и поднимет микрофон как обычно
+            partWaitDeadline = 0L
+            lastPartsTotal = lastPartNum
+            if (playQueue.isNotEmpty()) boundarySuppress = true   // «дальше» уже сказано — второго зазора не ставим
+        }
+        LogBus.add(tr("кнопка «дальше» — не жду, играю следующего", "“next” button — not waiting, playing the next one"))
+        // пустой микрофон зазора опускаем: иначе ветер (lastLoudTs) держал бы ответ придержкой «ты диктуешь»
+        if (listening) stopListening()
+        kickPlayback()
+        return true
+    }
 
     // v1.16-fix: ручной выбор другого канала во время озвучки главнее «ответь договорившему» —
     // иначе тап по кругу в зазоре увёл бы диктовку обратно в того, кого юзер уже сменил
@@ -4507,7 +4747,7 @@ class BridgeService : Service() {
                 main.post {
                     if (!alive) return@post
                     LogBus.add(tr("крайнее: играю последнее из «${proj}»", "latest: playing the last one from “${proj}”"))
-                    playFrom(bestSid, proj, items)
+                    playFrom(bestSid, proj, items, keepTarget = false)
                 }
             } catch (e: Exception) { main.post { LogBus.add(tr("крайнее: ошибка ${e.message?.take(60)}", "latest: error ${e.message?.take(60)}")) } }
         }.start()
@@ -4574,6 +4814,7 @@ class BridgeService : Service() {
                         return@post
                     }
                     Cfg.replyTarget = bestSid
+                    targetEpoch++
                     Cfg.save(this@BridgeService)
                     ensureTargetCues()   // v0.51: имя адресата — голосом
                     LogBus.add(tr("отвечаю в «$bestProj» — диктуй", "replying to “$bestProj” — dictate"))
@@ -4982,6 +5223,7 @@ class BridgeService : Service() {
                     val idx = it.lowercase().lastIndexOf(matched)
                     if (idx >= 0) it.substring(0, idx) else it
                 }.trim().trimEnd(',', '.', '!', ' ')
+                if (cut.isNotEmpty() && draft.isEmpty()) draftStartTs = listenStartedAt   // v1.43
                 if (cut.isNotEmpty()) draft.append(if (draft.isEmpty()) "" else " ").append(cut)
                 val msg = draft.toString().trim()
                 draft.setLength(0); lastPartial = ""   // v0.46-fix: мысль ушла — догадку не дошлём дублем
@@ -5000,6 +5242,7 @@ class BridgeService : Service() {
         // перевзводился каждым финалом. HARD_CAP_MS (firstArmTs) остаётся неподвижным.
         lastTextTs = finTs
         lastActivityTs = finTs
+        if (draft.isEmpty()) draftStartTs = listenStartedAt   // v1.43: см. send()
         draft.append(if (draft.isEmpty()) "" else " ").append(t.trim())
         LogBus.add(tr("черновик: …${draft.takeLast(80)}", "draft: …${draft.takeLast(80)}"))
         scheduleAutoSend()   // v0.5: новый кусок в черновике — перезапустить отсчёт тишины
@@ -5009,7 +5252,16 @@ class BridgeService : Service() {
     // v0.36 (аудит): сбой сети больше НЕ теряет надиктованное безвозвратно (draft очищается
     // до send во всех путях): один повтор через 3с, затем текст ложится в очередь unsent и
     // досылается при реконнекте. Отклонение сервером (4xx) не повторяем — это не сеть.
-    private fun send(text: String, attempt: Int = 0) {
+    // v1.43 (хвост ревью v1.42): began — подъём микрофона, на котором начат черновик. Ответом на
+    // текущее сообщение считаем только начатое ПОСЛЕ того, как оно зазвучало — как в utt_sent.
+    // Момент отправки для этого не годится: черновик, начатый до ответа, засчитывался бы ему.
+    private fun takeDraftStart(): Long {
+        val b = if (draftStartTs > 0) draftStartTs else listenStartedAt
+        draftStartTs = 0L
+        return b
+    }
+
+    private fun send(text: String, attempt: Int = 0, began: Long = takeDraftStart()) {
         val sentAt = System.currentTimeMillis()
         val sid = Cfg.replyTarget.ifEmpty { lastSession ?: "" }
         val projLabel = SessionBook.all().firstOrNull { it.sid == sid }?.proj ?: lastProj
@@ -5029,7 +5281,7 @@ class BridgeService : Service() {
                     if (!alive) return@post
                     if (attempt == 0) {
                         LogBus.add(tr("отправка не удалась (${e.message?.take(30)}) — повтор через 3с", "send failed (${e.message?.take(30)}) — retry in 3s"))
-                        main.postDelayed({ if (alive) send(text, 1) }, 3000)
+                        main.postDelayed({ if (alive) send(text, 1, began) }, 3000)
                         return@post
                     }
                     if (unsent.size < 10) unsent.addLast(text)
@@ -5086,7 +5338,7 @@ class BridgeService : Service() {
                         } catch (_: Exception) {}
                         LogBus.add(tr("отправлено в «${projLabel ?: "?"}»: ${text.take(60)}", "sent to “${projLabel ?: "?"}”: ${text.take(60)}"))
                         // v0.69: эхо для ленты-чата — сам движок не меняется (см. Feed.kt)
-                        answeredCurrent = true   // v0.81
+                        if (began >= speakerStartTs) answeredCurrent = true   // v0.81; v1.43: начало черновика, см. utt_sent
                         // v0.85: ручной выбор действовал на это сообщение (v1.16-fix: если оно ушло
                         // в него и отправлено после выбора)
                         if (sid == Cfg.replyTarget && sentAt >= manualPinTs) manualPinTs = 0L
