@@ -1,7 +1,5 @@
 # Claudio Code
 
-<!-- DRAFT for the public repo (store build, English). -->
-
 A hands-free walkie-talkie for [Claude Code](https://claude.com/claude-code): your Claude Code
 sessions speak their replies into your earphones, and you answer by voice from an Android
 phone — while walking, riding or cooking. Several sessions become channels you can switch
@@ -37,18 +35,18 @@ through machines you control.
    its `config.json` (relay address, token) and register it as a Stop hook in
    `~/.claude/settings.json`. Every reply is voiced (edge-tts + ffmpeg) and sent to the relay.
    In a session, start the inbox poller (the `voice-bridge` skill from this repo).
-3. **Phone** — install the app, scan the QR code from your server. Address, token and
+3. **Phone** — install the app (APK from [Releases](https://github.com/1nspectorCat/Claudio-Code/releases/latest)), scan the QR code from your server. Address, token and
    certificate fingerprint are set automatically. Tap the circle and say "hello".
 
-Details: [SETUP.md](SETUP.md). How to use the app: [GUIDE.md](GUIDE.md).
-Privacy: [PRIVACY.md](PRIVACY.md).
+Details: [SETUP.md](docs/SETUP.md). How to use the app: [GUIDE.md](docs/GUIDE.md).
+Privacy: [PRIVACY.md](docs/PRIVACY.md).
 
 ## Speech recognition
 
 By default the app uses Android's own speech recognizer (English, en-US). Optionally you can
 run whisper.cpp on your server for better recognition in noise (`transcribe.js`, "advanced" →
 Whisper in the app). Whisper detects the language automatically; to pin it, set
-`WHISPER_LANG` (see [SETUP.md](SETUP.md#whisper-optional-advanced)).
+`WHISPER_LANG` (see [SETUP.md](docs/SETUP.md#whisper-optional-advanced)).
 
 ## In development
 
@@ -65,4 +63,4 @@ hidden in this build until the hub server is cleaned up and published.
 
 ## License
 
-<!-- TODO: same license as the current public repo. -->
+MIT, see [LICENSE](LICENSE).
