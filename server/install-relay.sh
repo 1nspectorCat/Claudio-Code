@@ -34,12 +34,12 @@ PIN=$(openssl x509 -in cert.pem -outform DER | openssl dgst -sha256 | awk '{prin
 TOKEN=""
 if [ -f config.json ]; then
   if ! TOKEN=$(node -e "console.log(JSON.parse(require('fs').readFileSync('config.json','utf8')).token||'')" 2>/dev/null); then
-    echo "config.json нечитаем (битый JSON) — почини или удали его и перезапусти"; exit 1
+    echo "config.json is unreadable (broken JSON) — fix or delete it and rerun"; exit 1
   fi
-  # порт живого конфига — истина: релей слушает его, а не env PORT
+  # the live config port wins: the relay listens on it, not on env PORT
   CFG_PORT=$(node -e "console.log(JSON.parse(require('fs').readFileSync('config.json','utf8')).port||8443)")
   if [ -n "${PORT:-}" ] && [ "$PORT" != "$CFG_PORT" ]; then
-    echo "порт берётся из config.json: $CFG_PORT (env PORT=$PORT проигнорирован — поменяй его в config.json)"
+    echo "port is taken from config.json: $CFG_PORT (env PORT=$PORT ignored — change it in config.json)"
   fi
   PORT="$CFG_PORT"
 fi
@@ -57,25 +57,25 @@ health() {
 
 if command -v pm2 >/dev/null; then
   if ! pm2 describe voice-relay >/dev/null 2>&1 && health; then
-    # порт занят посторонним node (запускали без pm2) — второй экземпляр ушёл бы в crash-loop
-    echo "релей уже запущен ВНЕ pm2 — убей его (pkill -f 'node.*relay.js') и перезапусти скрипт"
+    # the port is held by a stray node (started without pm2) — a second instance would crash-loop
+    echo "the relay is already running OUTSIDE pm2 — kill it (pkill -f 'node.*relay.js') and rerun the script"
     exit 1
   fi
   pm2 restart voice-relay 2>/dev/null || pm2 start relay.js --name voice-relay
   pm2 save >/dev/null 2>&1 || true
 elif health; then
-  echo "релей уже работает на порту $PORT — второй не запускаю"
+  echo "the relay is already running on port $PORT — not starting a second one"
 else
   echo "(hint: install pm2 to keep the relay alive across reboots: npm i -g pm2)"
   nohup node relay.js >relay.out 2>&1 &
 fi
 
-# Честная проверка: ссылку печатаем только если релей реально отвечает
+# Honest check: print the link only if the relay really answers
 sleep 2
 if ! health; then
   echo
-  echo "ОШИБКА: релей не отвечает на https://127.0.0.1:$PORT/status"
-  echo "смотри логи: pm2 logs voice-relay  (или файл relay.out)"
+  echo "ERROR: the relay does not answer at https://127.0.0.1:$PORT/status"
+  echo "see the logs: pm2 logs voice-relay  (or the relay.out file)"
   exit 1
 fi
 
@@ -85,23 +85,23 @@ IP="${IP:-$(curl -sf -4 -m 5 ifconfig.me || true)}"
 [ -n "$IP" ] || IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
 if ! echo "$IP" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
   echo
-  echo "не смог определить внешний IPv4 (получил: '$IP')"
-  echo "перезапусти с явным адресом:  IP=x.x.x.x bash install-relay.sh"
+  echo "could not detect the external IPv4 (got: '$IP')"
+  echo "rerun with an explicit address:  IP=x.x.x.x bash install-relay.sh"
   exit 1
 fi
 LINK="claudio://setup?url=https://$IP:$PORT&token=$TOKEN&pin=$PIN"
 
 echo
-echo "── настройка телефона ──────────────────────────────────"
-echo "ссылка-настройка (открой на телефоне или отсканируй QR):"
+echo "── phone setup ─────────────────────────────────────────"
+echo "setup link (open it on the phone or scan the QR):"
 echo
 echo "  $LINK"
 echo
 if command -v qrencode >/dev/null; then
   qrencode -t ansiutf8 "$LINK"
 else
-  echo "(поставь qrencode, чтобы видеть QR прямо здесь: apt install qrencode)"
+  echo "(install qrencode to see the QR right here: apt install qrencode)"
 fi
 echo
-echo "ручной вариант — вставить в приложении одной строкой:"
+echo "manual option — paste into the app as one line:"
 echo "  https://$IP:$PORT|$TOKEN|$PIN"
